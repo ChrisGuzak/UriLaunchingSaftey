@@ -15,19 +15,23 @@ the web.
 Uri scheme creators have to consider this threat when they design their scheme and its handling.
 Untrusted invokes are possible. In some cases, this eliminates the possibility of using uri launching in designs.
 
-This threat is currently mitigated by this dialog presneted in Microsoft Edge.
+### Current Mitigation - Display a confirmation prompt.
+
+This threat is currently mitigated by this dialog presented in Microsoft Edge.
 ![Uri Launch Warning U I](UriLaunchWarningUI.png).
 
-### Improvements to the prompt based mitigation.
+#### Potential Improvements
 
 Web Browsers should display the name, publisher and other information that identifies the program that is going
 to be launched to help users make decisions about what is a legitimate launch case.
 Windows APIs provide access to this information when launching with `ShellExecuteExW()` using 
 `IHandlerActivationHost`/`IHandlerInfo` on the service provider object. This sample demonstrates how to do this.
 
-## New Mitigation - Detecting Local only Uris
+### New Mitigation - Detecting Local only Uris
 
-### `local+` Prefix match
+In this mitigation, the local only Uris are detected and the browsers never try to launch them.
+
+#### `local+` Prefix match
 
 Schemes with the prefix are considered local only. Here is the template for the registry configuration
 for such a scheme.
@@ -36,7 +40,7 @@ HKCR\local+<scheme suffix>
     "URL Protocol"
 ```
 
-### Registry Configuration
+#### Registry Configuration
 
 For existing schemes that don't have a `local+` prefix that want this behavior, they opt in via registration
 using the `LocalOnly` registry value.
@@ -47,7 +51,7 @@ HKCR\<scheme>
     LocalOnly
 ```
 
-### Minimum URL Zone
+#### Minimum URL Zone
 
 An alternative proposal allows a minimum URLZONE to be specified. When `URLZONE_LOCAL_MACHINE`
 is used, this has the same effect `LocalOnly`.
@@ -72,7 +76,7 @@ enum URLZONE {
 }
 ```
 
-## Design Questions
+### Design Questions
 
 - Is it useful to allow schemes to specify a minimum zone too? 
 That would enable Web Pages on the Intranet to launch some schemes.
