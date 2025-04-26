@@ -133,7 +133,7 @@ public:
                 if (SUCCEEDED(queryAssoc->GetData(ASSOCF_NONE, ASSOCDATA_VALUE, L"MinimumAllowedUrlZone", &minZone, &minZoneSize)))
                 {
                     auto zoneOfLaunchInput = URLZONE::URLZONE_INTERNET; // browsers
-                    cpp_unit::LogMessage(L"MinimumZone %d", minZone);
+                    cpp_unit::LogMessage(L"MinimumAllowedUrlZone %d", minZone);
                     if (static_cast<URLZONE>(minZone) < zoneOfLaunchInput) // "less than" test as zone values increase for lower trust
                     {
                         cpp_unit::LogMessage(L"Launch blocked");

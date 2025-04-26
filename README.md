@@ -1,27 +1,31 @@
 # Uri Launching Safety - Local Only Uri Schemes
 
-This project demonstrates how applications (WebBrowsers) that launch uris from untrusted sources 
-can mitigate the danger created by enabling uris to be identified as "local only" for launching.
+This project demonstrates how applications (WebBrowsers) that launch Uris from untrusted sources 
+can mitigate the danger created by enabling Uris to be identified as "local only" for launching.
 
-This is based on a naming system where `local+` is use as a prefix for schemes to identify them as
+This is based on a naming system where `local+` is use as a prefix to identify them as
 local only. It also allows the schemes registration to specify this.
 
 ## The Security Threat
 
-Web pages and other untrusted programs can launch uris that are not safe to launch. For example, a web page
-can invoke `ms-setting:` or `shell:` which can launch applications that are intended to be run from the web.
+Web pages and other untrusted programs can launch Uris that are not safe to launch. For example, a web page
+can invoke `ms-setting:` or `shell:` which can launch applications that are not intended to be run from 
+the web.
 
 Uri scheme creators have to consider this threat when they design their scheme and its handling.
 Untrusted invokes are possible. In some cases, this eliminates the possibility of using uri launching in designs.
 
-This threat is currently mitigated by this dialog.
+This threat is currently mitigated by this dialog presneted in Microsoft Edge.
 ![Uri Launch Warning U I](UriLaunchWarningUI.png).
 
-Web Browsers should display the name of the program that is going
-to be launched to help users make decisions like based on the Windows APIs that provide access to this when
-launching with `ShellExecuteExW()` using `IHandlerActivationHost`/`IHandlerInfo`.
+### Improvements to the prompt based mitigation.
 
-## Detecting Local only
+Web Browsers should display the name, publisher and other information that identifies the program that is going
+to be launched to help users make decisions about what is a legitimate launch case.
+Windows APIs that provide access to this when launching with `ShellExecuteExW()` using 
+`IHandlerActivationHost`/`IHandlerInfo` on the service provider object.
+
+## New Mitigation - Detecting Local only Uris
 
 ### `local+` Prefix match
 
@@ -41,6 +45,31 @@ using the `LocalOnly` registry value.
 HKCR\<scheme>
     "URL Protocol"
     LocalOnly
+```
+
+### Minimum URL Zone
+
+An alternative proposal allows a minimum URLZONE to be specified. When `URLZONE_LOCAL_MACHINE`
+is used, this has the same effect `LocalOnly`.
+
+This approach also enables the handler of the launch, via its ProgId, to declare its local 
+only status without needing to use a specific prefix or provide registration on the scheme itself.
+
+```
+HKCR\<scheme progId>
+    MinimumAllowedUrlZone = 0
+    \shell\open\command 
+        UriInvokeHandler.exe %1
+```
+
+```cpp
+enum URLZONE { 
+  URLZONE_LOCAL_MACHINE	= 0,
+  URLZONE_INTRANET = 1,
+  URLZONE_TRUSTED	= 2,
+  URLZONE_INTERNET = 3,
+  URLZONE_UNTRUSTED = 4,
+}
 ```
 
 ## Design Questions
