@@ -22,8 +22,8 @@ This threat is currently mitigated by this dialog presneted in Microsoft Edge.
 
 Web Browsers should display the name, publisher and other information that identifies the program that is going
 to be launched to help users make decisions about what is a legitimate launch case.
-Windows APIs that provide access to this when launching with `ShellExecuteExW()` using 
-`IHandlerActivationHost`/`IHandlerInfo` on the service provider object.
+Windows APIs provide access to this information when launching with `ShellExecuteExW()` using 
+`IHandlerActivationHost`/`IHandlerInfo` on the service provider object. This sample demonstrates how to do this.
 
 ## New Mitigation - Detecting Local only Uris
 
