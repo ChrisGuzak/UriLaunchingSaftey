@@ -1,0 +1,5 @@
+#define DEFINE_FLAGS_ENUM_CLASS_OPERATORS(FLAGS_ENUM_T, __VA_ARGS__) enum classs FLAGS_ENUM_T {__VA_ARGS__}
+#define DEFINE_FLAGS_ENUM_OPERATORS(FLAGS_ENUM_T, __VA_ARGS__) enum FLAGS_ENUM_T {__VA_ARGS__}
+#define TEST_CLASS(className)
+#define TEST_METHOD(methodName)
+
