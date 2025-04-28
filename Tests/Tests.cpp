@@ -1,4 +1,7 @@
 #include "pch.h"
+#include <wil/registry.h>
+
+#pragma comment(lib, "shlwapi.lib") // link to this
 
 template <typename HostT>
 class ActivationServiceProvider : public winrt::implements<ActivationServiceProvider<HostT>, IServiceProvider, IHandlerActivationHost>
@@ -66,10 +69,8 @@ namespace UriLaunchingSafetey
 TEST_CLASS(UseCases)
 {
 public:
-
     void BeforeCoCreateInstance(REFCLSID clsidHandler, _In_opt_ IShellItemArray* items, IHandlerInfo* handlerInfo)
     {
-
     }
 
     void BeforeCreateProcess(PCWSTR applicationPath, PCWSTR commandLine, IHandlerInfo* handlerInfo)
@@ -155,8 +156,68 @@ public:
         ShellExecuteItemWithVerb(nullptr, service->GetAsSite(), nullptr, nullptr, uriItem.get());
     }
 
+    static wil::com_ptr<IQueryAssociations> CreateUriSchemeAssocHandler(PCWSTR uriScheme)
+    {
+        wil::com_ptr<IQueryAssociations> queryAssoc;
+        THROW_IF_FAILED(AssocCreate(CLSID_QueryAssociations, IID_PPV_ARGS(&queryAssoc)));
+        THROW_IF_FAILED(queryAssoc->Init(ASSOCF_IS_PROTOCOL, uriScheme, nullptr, nullptr));
+        return queryAssoc;
+    }
+
+    bool IsLocalOnlyUriScheme(PCWSTR scheme)
+    {
+        const auto schemeView = std::wstring_view(scheme);
+        const auto localPrefix = std::wstring_view(L"local+");
+
+        // In C++ 20 this can be (schemeView.starts_with("local+"))
+        if ((schemeView.size() >= localPrefix.size()) && (schemeView.compare(0, localPrefix.size(), localPrefix) == 0))
+        {
+            return true;
+        }
+        else
+        {
+            auto queryAssoc = CreateUriSchemeAssocHandler(scheme);
+            if (SUCCEEDED(queryAssoc->GetData(ASSOCF_NONE, ASSOCDATA_VALUE, L"LocalOnly", nullptr, nullptr)))
+            {
+                return true;
+            }
+
+            /*
+            // TODO: this should only apply to in box Uri handlers, those who's
+            // module is protected with WRP (owned by TrusteInstaller)
+            DWORD editFlags{}, editFlagsSize = sizeof(editFlags);
+            if (SUCCEEDED(queryAssoc->GetData(ASSOCF_NONE, ASSOCDATA_EDITFLAGS, nullptr, &editFlags, &editFlagsSize)) &&
+                WI_IsFlagClear(editFlags, FTA_SafeForElevation))
+            {
+                return true;
+            }
+            */
+            return false;
+        }
+    }
+
+    // AssocDump /DumpUriSchemesThatAreSafeForElevation
+    // AssocDump /DumpUriSchemesWithSystemHandlers
     TEST_METHOD(DetectLocalOnlyUriSchemes)
     {
+        cpp_unit::Assert::IsTrue(IsLocalOnlyUriScheme(L"local+some-uri-scheme"));
+        cpp_unit::Assert::IsFalse(IsLocalOnlyUriScheme(L"http"));
+        cpp_unit::Assert::IsFalse(IsLocalOnlyUriScheme(L"ms-settings"));
+        // This should be local only based on the module being a windows component
+        // but IsLocalOnlyUriScheme helper does not support that yet.
+        // cpp_unit::Assert::IsTrue(IsLocalOnlyUriScheme(L"explorer.zipselection"));
+
+        // Like CreateLocalOnlySchemes.ps1
+        auto schemeKey = wil::reg::create_unique_key(HKEY_CURRENT_USER, LR"(Software\Classes\local+uri-scheme)",
+            wil::reg::key_access::readwrite);
+        wil::reg::set_value(schemeKey.get(), L"URL Protocol", L"");
+        wil::reg::set_value(schemeKey.get(), L"LocalOnly", L"");
+        cpp_unit::Assert::IsTrue(IsLocalOnlyUriScheme(L"local+uri-scheme"));
+
+        schemeKey = wil::reg::create_unique_key(HKEY_CURRENT_USER, LR"(Software\Classes\uri-scheme-local-only)", wil::reg::key_access::readwrite);
+        wil::reg::set_value(schemeKey.get(), L"URL Protocol", L"");
+        wil::reg::set_value(schemeKey.get(), L"LocalOnly", L"");
+        cpp_unit::Assert::IsTrue(IsLocalOnlyUriScheme(L"uri-scheme-local-only"));
     }
 };
 
