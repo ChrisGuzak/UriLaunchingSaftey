@@ -4,7 +4,8 @@
 #pragma comment(lib, "shlwapi.lib") // link to this
 
 template <typename HostT>
-class ActivationServiceProvider : public winrt::implements<ActivationServiceProvider<HostT>, IServiceProvider, IHandlerActivationHost>
+class ActivationServiceProvider : public winrt::implements<ActivationServiceProvider<HostT>, 
+    IServiceProvider, IHandlerActivationHost, ICreatingProcess>
 {
 public:
     ActivationServiceProvider(HostT* host = nullptr) : m_host(host)
@@ -15,7 +16,8 @@ public:
     IFACEMETHODIMP QueryService(REFGUID serviceId, REFIID riid, __deref_out void** ppv) noexcept override
     {
         *ppv = nullptr;
-        return (serviceId == SID_SHandlerActivationHost) ? QueryInterface(riid, ppv) : E_NOTIMPL;
+        return ((serviceId == SID_SHandlerActivationHost) ||
+                (serviceId == SID_ExecuteCreatingProcess)) ? QueryInterface(riid, ppv) : E_NOTIMPL;
     }
 
     // IHandlerActivationHost
@@ -30,6 +32,14 @@ public:
     {
         m_host->BeforeCreateProcess(applicationPath, commandLine, handlerInfo);
         m_host->ReportHandlerInfo(handlerInfo);
+        return S_OK;
+    }
+
+    IFACEMETHODIMP OnCreating(ICreateProcessInputs* inputs) noexcept override
+    {
+        // Indicate what is being launched is from an untrusted source.
+        // Processes can retrieve this via GetStartupInfoW() STARTUPINFOW.dwFlags
+        inputs->AddStartupFlags(STARTF_UNTRUSTEDSOURCE);
         return S_OK;
     }
 
@@ -183,7 +193,7 @@ public:
             }
 
             /*
-            // TODO: this should only apply to in box Uri handlers, those who's
+            // TODO: this should only apply to Windows OS Uri handlers, those who's
             // module is protected with WRP (owned by TrusteInstaller)
             DWORD editFlags{}, editFlagsSize = sizeof(editFlags);
             if (SUCCEEDED(queryAssoc->GetData(ASSOCF_NONE, ASSOCDATA_EDITFLAGS, nullptr, &editFlags, &editFlagsSize)) &&
