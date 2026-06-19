@@ -224,10 +224,17 @@ public:
         wil::reg::set_value(schemeKey.get(), L"LocalOnly", L"");
         cpp_unit::Assert::IsTrue(IsLocalOnlyUriScheme(L"local+uri-scheme"));
 
-        schemeKey = wil::reg::create_unique_key(HKEY_CURRENT_USER, LR"(Software\Classes\uri-scheme-local-only)", wil::reg::key_access::readwrite);
+        // The crux question: does the assoc query API detect the LocalOnly value
+        // when it is registered as REG_NONE? REG_NONE is the recommended type: a
+        // presence-only marker that carries no payload, avoiding the odd REG_DWORD=0
+        // (which reads like "off" while still being present).
+        //
+        // REG_DWORD also works (the assoc query API detects the value regardless of
+        // its type), but REG_NONE is preferred, so only REG_NONE is tested here.
+        schemeKey = wil::reg::create_unique_key(HKEY_CURRENT_USER, LR"(Software\Classes\uri-scheme-local-only-none)", wil::reg::key_access::readwrite);
         wil::reg::set_value(schemeKey.get(), L"URL Protocol", L"");
-        wil::reg::set_value(schemeKey.get(), L"LocalOnly", L"");
-        cpp_unit::Assert::IsTrue(IsLocalOnlyUriScheme(L"uri-scheme-local-only"));
+        wil::reg::set_value_binary(schemeKey.get(), L"LocalOnly", REG_NONE, {});
+        cpp_unit::Assert::IsTrue(IsLocalOnlyUriScheme(L"uri-scheme-local-only-none"));
     }
 };
 

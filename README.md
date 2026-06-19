@@ -48,8 +48,14 @@ using the `LocalOnly` registry value.
 ```
 HKCR\<scheme>
     "URL Protocol"
-    LocalOnly
+    LocalOnly = REG_NONE
 ```
+
+The presence of the `LocalOnly` value is the signal; it carries no payload. It is registered as a
+`REG_NONE` value. The association query API (`IQueryAssociations::GetData` with `ASSOCDATA_VALUE`)
+detects the value regardless of its type, so `REG_DWORD` also works, but `REG_NONE` is preferred:
+it is a presence-only marker and avoids the ambiguity of a `REG_DWORD = 0`, which reads like "off"
+while still being present.
 
 #### Minimum URL Zone
 
