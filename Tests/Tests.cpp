@@ -1,7 +1,193 @@
 #include "pch.h"
 #include <wil/registry.h>
 
+#include <appmodel.h>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <thread>
+
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.ApplicationModel.h>
+#include <winrt/Windows.ApplicationModel.AppExtensions.h>
+
 #pragma comment(lib, "shlwapi.lib") // link to this
+
+// ---------------------------------------------------------------------------
+// POC helpers: packaged URI scheme detection + AppExtension LocalOnly detection
+// ---------------------------------------------------------------------------
+
+// The shell-owned AppExtension contract that packaged handlers declare to mark a
+// URI scheme as "local only" (see README "Packaged Uri Scheme Handlers").
+constexpr PCWSTR c_localOnlyUriSchemeContract = L"com.microsoft.windows.urischeme.localonly";
+
+struct UriSchemeHandlerPackage
+{
+    bool isPackaged{};                 // handler resolved to a real AUMID
+    std::wstring appUserModelId;       // raw ASSOCSTR_APPID value (AUMID for packaged, plain name for classic)
+    std::wstring packageFamilyName;    // prefix of the AUMID (stable identifier)
+    std::wstring packageFullName;      // resolved via GetPackagesByPackageFamily (version-stamped)
+};
+
+// Public-API recipe: query the scheme's *default* handler AppUserModelID. If it parses
+// as a real AUMID the handler is a packaged app; otherwise it's a classic (unpackaged)
+// app or there is no handler. Returns the family/full name when packaged.
+inline UriSchemeHandlerPackage GetUriSchemeHandlerPackage(PCWSTR scheme)
+{
+    UriSchemeHandlerPackage result;
+
+    wchar_t aumid[APPLICATION_USER_MODEL_ID_MAX_LENGTH]{};
+    DWORD aumidLen = ARRAYSIZE(aumid);
+    // ASSOCF_IS_PROTOCOL: 'scheme' is a URI scheme, not a file extension.
+    if (FAILED(AssocQueryStringW(ASSOCF_IS_PROTOCOL, ASSOCSTR_APPID, scheme, nullptr, aumid, &aumidLen)))
+    {
+        return result; // no handler, or a desktop handler that exposes no AUMID
+    }
+    result.appUserModelId = aumid;
+
+    // Validate + split AUMID = "<PackageFamilyName>!<PRAID>". Classic handlers return a
+    // plain name (e.g. "MSEdge") which fails to parse -> a clean packaged/unpackaged discriminator.
+    wchar_t family[PACKAGE_FAMILY_NAME_MAX_LENGTH + 1]{};
+    UINT32 familyLen = ARRAYSIZE(family);
+    wchar_t praid[APPLICATION_USER_MODEL_ID_MAX_LENGTH]{};
+    UINT32 praidLen = ARRAYSIZE(praid);
+    if (ParseApplicationUserModelId(aumid, &familyLen, family, &praidLen, praid) != ERROR_SUCCESS)
+    {
+        return result; // not a packaged AUMID -> classic/unpackaged handler
+    }
+
+    result.isPackaged = true;
+    result.packageFamilyName = family;
+
+    // family -> full name (one package per family per user). Two-call buffer pattern.
+    UINT32 count = 0, bufChars = 0;
+    if (GetPackagesByPackageFamily(family, &count, nullptr, &bufChars, nullptr) == ERROR_INSUFFICIENT_BUFFER && count)
+    {
+        std::vector<PWSTR> fullNames(count);
+        std::wstring buffer(bufChars, L'\0');
+        if (GetPackagesByPackageFamily(family, &count, fullNames.data(), &bufChars, buffer.data()) == ERROR_SUCCESS && count)
+        {
+            result.packageFullName = fullNames[0];
+        }
+    }
+    return result;
+}
+
+struct LocalOnlyAppExtension
+{
+    std::wstring extensionId;            // AppExtension Id (instance label)
+    std::wstring packageFamilyName;     // declaring package
+    std::vector<std::wstring> schemes;  // resolved scheme list (from <Scheme> and <Schemes>)
+    std::wstring rawProps;              // debug: every top-level property key + leaf text
+};
+
+// Reads the inner text of a leaf AppExtension property. A manifest element like
+// <Scheme>foo</Scheme> surfaces as props["Scheme"] -> IPropertySet -> ["#text"] -> "foo".
+inline std::wstring ReadLeafProperty(
+    winrt::Windows::Foundation::Collections::IPropertySet const& props, PCWSTR name)
+{
+    if (props && props.HasKey(name))
+    {
+        if (auto leaf = props.Lookup(name).try_as<winrt::Windows::Foundation::Collections::IPropertySet>())
+        {
+            if (leaf.HasKey(L"#text"))
+            {
+                return winrt::unbox_value_or<winrt::hstring>(leaf.Lookup(L"#text"), {}).c_str();
+            }
+        }
+    }
+    return {};
+}
+
+inline std::vector<std::wstring> SplitDelimited(std::wstring const& value, wchar_t delim)
+{
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    while (start <= value.size())
+    {
+        auto pos = value.find(delim, start);
+        auto token = value.substr(start, pos == std::wstring::npos ? std::wstring::npos : pos - start);
+        if (!token.empty())
+        {
+            parts.push_back(token);
+        }
+        if (pos == std::wstring::npos)
+        {
+            break;
+        }
+        start = pos + 1;
+    }
+    return parts;
+}
+
+// Enumerate every packaged handler that declares the local-only contract and the URI
+// scheme(s) it marks. Must run in an MTA (blocks on the async catalog/property calls).
+inline std::vector<LocalOnlyAppExtension> CollectLocalOnlyAppExtensionSchemes()
+{
+    using namespace winrt::Windows::ApplicationModel::AppExtensions;
+    using winrt::Windows::Foundation::Collections::IPropertySet;
+
+    std::vector<LocalOnlyAppExtension> result;
+    auto catalog = AppExtensionCatalog::Open(c_localOnlyUriSchemeContract);
+    auto extensions = catalog.FindAllAsync().get();
+    for (auto const& ext : extensions)
+    {
+        LocalOnlyAppExtension info;
+        info.extensionId = ext.Id().c_str();
+        info.packageFamilyName = ext.AppInfo().PackageFamilyName().c_str();
+
+        auto props = ext.GetExtensionPropertiesAsync().get();
+        if (props)
+        {
+            // Dump every top-level property key so we can see how repeated/container
+            // elements actually surface in the IPropertySet.
+            for (auto const& kv : props)
+            {
+                std::wstring text;
+                if (auto leaf = kv.Value().try_as<IPropertySet>())
+                {
+                    if (leaf.HasKey(L"#text"))
+                    {
+                        text = winrt::unbox_value_or<winrt::hstring>(leaf.Lookup(L"#text"), {}).c_str();
+                    }
+                }
+                info.rawProps += std::wstring(kv.Key().c_str()) + L"=[" + text + L"] ";
+            }
+
+            // Shape A: a (repeated) <Scheme> element.
+            if (auto one = ReadLeafProperty(props, L"Scheme"); !one.empty())
+            {
+                info.schemes.push_back(one);
+            }
+            // Shape B: a delimited <Schemes> element, e.g. "a;b;c".
+            for (auto& scheme : SplitDelimited(ReadLeafProperty(props, L"Schemes"), L';'))
+            {
+                info.schemes.push_back(scheme);
+            }
+        }
+        result.push_back(std::move(info));
+    }
+    return result;
+}
+
+// Run a callable on a dedicated MTA thread so winrt .get() never blocks an STA/UI thread.
+template <typename Fn>
+auto RunOnMtaThread(Fn&& fn) -> decltype(fn())
+{
+    decltype(fn()) result{};
+    std::exception_ptr error;
+    std::thread worker([&]
+    {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        try { result = fn(); }
+        catch (...) { error = std::current_exception(); }
+        winrt::uninit_apartment();
+    });
+    worker.join();
+    if (error) { std::rethrow_exception(error); }
+    return result;
+}
 
 template <typename HostT>
 class ActivationServiceProvider : public winrt::implements<ActivationServiceProvider<HostT>, 
@@ -235,6 +421,127 @@ public:
         wil::reg::set_value(schemeKey.get(), L"URL Protocol", L"");
         wil::reg::set_value_binary(schemeKey.get(), L"LocalOnly", REG_NONE, {});
         cpp_unit::Assert::IsTrue(IsLocalOnlyUriScheme(L"uri-scheme-local-only-none"));
+    }
+};
+
+// POC: detect whether a URI scheme is handled by a packaged app, and whether a
+// packaged handler has declared the scheme "local only" via the AppExtension contract.
+TEST_CLASS(PackagedUriSchemeDetection)
+{
+public:
+    static void LogPackageResult(PCWSTR scheme, UriSchemeHandlerPackage const& pkg)
+    {
+        if (pkg.isPackaged)
+        {
+            cpp_unit::LogMessage(L"%-20ls PACKAGED   family=%ls  full=%ls  (aumid=%ls)",
+                scheme, pkg.packageFamilyName.c_str(),
+                pkg.packageFullName.empty() ? L"<unresolved>" : pkg.packageFullName.c_str(),
+                pkg.appUserModelId.c_str());
+        }
+        else if (!pkg.appUserModelId.empty())
+        {
+            cpp_unit::LogMessage(L"%-20ls unpackaged (classic handler, appId=%ls)", scheme, pkg.appUserModelId.c_str());
+        }
+        else
+        {
+            cpp_unit::LogMessage(L"%-20ls no handler / no AppUserModelID", scheme);
+        }
+    }
+
+    // Enumerate well-known schemes that typically have packaged or unpackaged handlers.
+    // Results are machine-dependent (depends on what's installed / set as default), so
+    // these are LOGGED for inspection; only stable invariants are asserted.
+    TEST_METHOD(DetectPackagedUriSchemes)
+    {
+        // Schemes commonly served by packaged (MSIX/appx) apps.
+        PCWSTR likelyPackaged[] = {
+            L"ms-photos",       // Microsoft.Windows.Photos
+            L"bingmaps",        // Microsoft.WindowsMaps
+            L"ms-drive-to",     // Microsoft.WindowsMaps
+            L"ms-store",        // Microsoft.WindowsStore
+            L"ms-windows-store",// Microsoft.WindowsStore
+            L"ms-clock",        // Microsoft.WindowsAlarms
+            L"ms-people",       // Microsoft.People
+            L"ms-settings",     // Windows.ImmersiveControlPanel (system, packaged)
+            L"ms-search",       // shell search (system)
+            L"ms-shellhost",    // ShellHost (system, packaged)
+        };
+
+        // Schemes commonly served by classic (unpackaged) handlers.
+        PCWSTR likelyUnpackaged[] = {
+            L"http",            // default browser (e.g. MSEdge desktop)
+            L"https",
+            L"mailto",          // default mail client
+        };
+
+        cpp_unit::LogMessage(L"--- likely packaged ---");
+        for (auto scheme : likelyPackaged)
+        {
+            LogPackageResult(scheme, GetUriSchemeHandlerPackage(scheme));
+        }
+
+        cpp_unit::LogMessage(L"--- likely unpackaged ---");
+        for (auto scheme : likelyUnpackaged)
+        {
+            LogPackageResult(scheme, GetUriSchemeHandlerPackage(scheme));
+        }
+
+        // Invariant: a scheme with no handler is never reported as packaged.
+        auto none = GetUriSchemeHandlerPackage(L"this-scheme-does-not-exist-zzz");
+        cpp_unit::Assert::IsFalse(none.isPackaged);
+        cpp_unit::Assert::IsTrue(none.packageFamilyName.empty());
+
+        // Invariant: when a scheme IS reported packaged, the AUMID parsed into a family name.
+        for (auto scheme : likelyPackaged)
+        {
+            auto pkg = GetUriSchemeHandlerPackage(scheme);
+            if (pkg.isPackaged)
+            {
+                cpp_unit::Assert::IsFalse(pkg.packageFamilyName.empty());
+                cpp_unit::Assert::AreNotEqual(std::wstring::npos, pkg.appUserModelId.find(L'!'));
+            }
+        }
+    }
+
+    // POC of the AppExtension-based local-only detection. On a typical dev box no package
+    // declares the contract yet, so this enumerates (likely empty) and logs whatever is found.
+    TEST_METHOD(EnumerateLocalOnlyAppExtensions)
+    {
+        auto extensions = RunOnMtaThread([] { return CollectLocalOnlyAppExtensionSchemes(); });
+
+        cpp_unit::LogMessage(L"contract '%ls' declared by %zu extension(s)",
+            c_localOnlyUriSchemeContract, extensions.size());
+        for (auto const& e : extensions)
+        {
+            cpp_unit::LogMessage(L"  id=%ls  package=%ls", e.extensionId.c_str(), e.packageFamilyName.c_str());
+            cpp_unit::LogMessage(L"    raw props: %ls", e.rawProps.c_str());
+            cpp_unit::LogMessage(L"    resolved schemes (%zu):", e.schemes.size());
+            for (auto const& s : e.schemes)
+            {
+                cpp_unit::LogMessage(L"      %ls", s.c_str());
+            }
+        }
+
+        // Demonstrate the resolver shape: "is this packaged scheme local only?"
+        auto isLocalOnlyPackagedScheme = [&](std::wstring_view scheme)
+        {
+            for (auto const& e : extensions)
+            {
+                for (auto const& s : e.schemes)
+                {
+                    if (s == scheme)
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+
+        // No assertion on a specific scheme (registration is environment-provided); just
+        // confirm the resolver runs against the enumerated set without throwing.
+        cpp_unit::LogMessage(L"is 'local+alpha' local-only (packaged)? %d",
+            isLocalOnlyPackagedScheme(L"local+alpha") ? 1 : 0);
     }
 };
 
