@@ -3,9 +3,11 @@
   <ItemGroup>
     <ClCompile Include="pch.cpp" />
     <ClCompile Include="Tests.cpp" />
+    <ClCompile Include="TargetedLaunchTests.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="pch.h" />
+    <ClInclude Include="TargetedLaunch.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />

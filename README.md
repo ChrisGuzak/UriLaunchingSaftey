@@ -3,6 +3,31 @@
 This project demonstrates how applications (WebBrowsers) that launch Uris from untrusted sources 
 can mitigate the danger created by enabling Uris to be identified as "local only" for launching.
 
+## TargetedLaunch
+
+`Tests\TargetedLaunch.h` contains the destination-side mitigation: constrain a URI launch
+to the exact requesting process (`PID + process sequence number`), an executable path or
+file name, a package family name, or a registered handler window. The accompanying tests
+demonstrate process/HANDLE/HWND identity, incoming COM callers, parent processes,
+ShellExecute site enforcement, COM server resolution, explicit process-to-path fallback,
+and after-create validation.
+
+For packaged-to-packaged communication, use
+[`LauncherOptions.TargetApplicationPackageFamilyName`](https://learn.microsoft.com/uwp/api/windows.system.launcheroptions.targetapplicationpackagefamilyname)
+with [`Launcher.LaunchUriAsync`](https://learn.microsoft.com/uwp/api/windows.system.launcher.launchuriasync)
+or [`Launcher.LaunchUriForResultsAsync`](https://learn.microsoft.com/uwp/api/windows.system.launcher.launchuriforresultsasync).
+The PFN policy identifies a package, not a particular running process. For unpackaged
+handlers, use the TargetedLaunch ShellExecute site path; `ShellExecuteExW` has no
+package-family selector and cannot by itself prove the ultimate single-instance process
+after a relay.
+
+`LaunchUriForResultsAsync` is a platform request/response contract with package identity
+and manifest requirements. TargetedLaunch is the unpackaged, destination-enforcement
+building block: it makes the target policy explicit and refuses when the target process
+or handler cannot be verified. See `Tests\TargetedLaunch-Design.md` for the full design,
+including how a registered accelerated-launch window can serve as a target-resolution
+source.
+
 This is based on a naming system where `local+` is use as a prefix to identify them as
 local only. It also allows the schemes registration to specify this.
 
@@ -243,4 +268,3 @@ That would enable Web Pages on the Intranet to launch some schemes.
 
 ## TODOs for the os.
 - Update all of the OS provided schemes that don't specify EditFlags FTA_SafeForElevation to add LocalOnly.
-

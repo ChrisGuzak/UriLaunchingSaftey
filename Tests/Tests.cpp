@@ -209,16 +209,18 @@ public:
     // IHandlerActivationHost
     IFACEMETHODIMP BeforeCoCreateInstance(REFCLSID clsidHandler, _In_opt_ IShellItemArray* items, IHandlerInfo* handlerInfo) noexcept override
     {
+        m_sawActivation = true;
         m_host->BeforeCoCreateInstance(clsidHandler, items, handlerInfo);
         m_host->ReportHandlerInfo(handlerInfo);
-        return S_OK;
+        return m_cancelActivation ? HRESULT_FROM_WIN32(ERROR_CANCELLED) : S_OK;
     }
 
     IFACEMETHODIMP BeforeCreateProcess(PCWSTR applicationPath, PCWSTR commandLine, IHandlerInfo* handlerInfo) noexcept override
     {
+        m_sawActivation = true;
         m_host->BeforeCreateProcess(applicationPath, commandLine, handlerInfo);
         m_host->ReportHandlerInfo(handlerInfo);
-        return S_OK;
+        return m_cancelActivation ? HRESULT_FROM_WIN32(ERROR_CANCELLED) : S_OK;
     }
 
     IFACEMETHODIMP OnCreating(ICreateProcessInputs* inputs) noexcept override
@@ -226,7 +228,20 @@ public:
         // Indicate what is being launched is from an untrusted source.
         // Processes can retrieve this via GetStartupInfoW() STARTUPINFOW.dwFlags
         inputs->AddStartupFlags(STARTF_UNTRUSTEDSOURCE);
-        return S_OK;
+        // A backstop: if the hooks above were somehow not reached, a cancelling site
+        // still must not let anything start.
+        return m_cancelActivation ? HRESULT_FROM_WIN32(ERROR_CANCELLED) : S_OK;
+    }
+
+    // Observe the resolved handler without committing to the launch.
+    void SetCancelActivation(bool cancel) noexcept
+    {
+        m_cancelActivation = cancel;
+    }
+
+    bool SawActivation() const noexcept
+    {
+        return m_sawActivation;
     }
 
     IUnknown* GetAsSite()
@@ -236,6 +251,8 @@ public:
 
 private:
     HostT* m_host;
+    bool m_cancelActivation{};
+    bool m_sawActivation{};
 };
 
 HRESULT ShellExecuteItemWithVerb(
@@ -340,16 +357,23 @@ public:
         }
     }
 
+    // Demonstrates the site chain observing a launch, without actually launching. Both
+    // activation hooks report what the shell resolved and then return ERROR_CANCELLED, so
+    // the test still exercises real handler resolution but never opens a browser. Running
+    // a test suite must not have side effects on the desktop.
     TEST_METHOD(LaunchWithShellExecute)
     {
         auto service = winrt::make_self<ActivationServiceProvider<UseCases>>(this);
+        service->SetCancelActivation(true);
 
-        PCWSTR uri = L"http://www.msn.com";
+        PCWSTR uri = L"http://example.com";
 
         wil::com_ptr<IShellItem> uriItem;
         THROW_IF_FAILED(SHCreateItemFromParsingName(uri, nullptr, IID_PPV_ARGS(&uriItem)));
 
-        ShellExecuteItemWithVerb(nullptr, service->GetAsSite(), nullptr, nullptr, uriItem.get());
+        const HRESULT hr = ShellExecuteItemWithVerb(nullptr, service->GetAsSite(), nullptr, nullptr, uriItem.get());
+        cpp_unit::Assert::AreEqual(HRESULT_FROM_WIN32(ERROR_CANCELLED), hr, L"the launch should have been cancelled");
+        cpp_unit::Assert::IsTrue(service->SawActivation(), L"the site chain was never consulted");
     }
 
     static wil::com_ptr<IQueryAssociations> CreateUriSchemeAssocHandler(PCWSTR uriScheme)
