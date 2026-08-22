@@ -15,6 +15,26 @@ namespace UriLaunchingSafetey
 
 namespace
 {
+    // A malformed uri is the only failure left that throws (from ResolveTargetedUriLaunch) -
+    // it is the caller's own usage error, not something the machine reported. Everything
+    // else (a refusal, a missing handler, an OS-level launch failure) is reported through
+    // LaunchTargetStatus / std::optional instead, since those are ordinary
+    // registration-driven outcomes a defensive caller must be able to check without a
+    // try/catch.
+    template <typename Func>
+    void AssertThrowsHr(HRESULT expected, Func&& func, PCWSTR message = nullptr)
+    {
+        try
+        {
+            func();
+            cpp_unit::Assert::Fail(message ? message : L"expected an exception, none was thrown");
+        }
+        catch (wil::ResultException const& e)
+        {
+            cpp_unit::Assert::AreEqual(expected, e.GetErrorCode(), message);
+        }
+    }
+
     LRESULT CALLBACK TestWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) noexcept
     {
         return DefWindowProcW(window, message, wParam, lParam);
@@ -386,10 +406,205 @@ public:
             ResolveTargetedUriLaunch(L"no-scheme-here", LaunchTargetPolicy::Unconstrained());
         });
 
-        // The HRESULT-returning entry point states the same thing as E_INVALIDARG.
-        cpp_unit::Assert::AreEqual(
-            E_INVALIDARG,
-            LaunchUriWithTarget(L"no-scheme-here", LaunchTargetPolicy::Unconstrained(), std::nullopt, true));
+        // The throwing entry point states the same thing as E_INVALIDARG.
+        AssertThrowsHr(E_INVALIDARG, []
+        {
+            LaunchUriWithTarget(L"no-scheme-here", LaunchTargetPolicy::Unconstrained(), std::nullopt, true);
+        });
+    }
+};
+
+// Selecting a *non-default* handler - the case AssocQueryString and
+// TryGetUriSchemeHandlerExecutablePath can never answer, because they only ever report
+// the default. This is the classic-desktop equivalent of Launcher.LaunchUriAsync's
+// PreferredApplicationId/PackageFamilyName.
+TEST_CLASS(TargetedLaunchHandlerSelection)
+{
+public:
+    // The default handler must itself appear in the "every registered app" enumeration -
+    // selecting *by* its own identity is the simplest thing that could work.
+    TEST_METHOD(SelectingTheDefaultHandlerByItsOwnPathFindsIt)
+    {
+        const auto defaultPath = TryGetUriSchemeHandlerExecutablePath(L"http");
+        cpp_unit::Assert::IsTrue(defaultPath.has_value(), L"no default handler registered for 'http'");
+
+        const auto selected =
+            TryFindUriSchemeHandler(L"http", UriHandlerSelection::ByExecutablePath(*defaultPath));
+        cpp_unit::Assert::IsTrue(selected.has_value(), L"the default handler did not appear in the enumeration");
+        cpp_unit::Assert::IsTrue(EqualsIgnoreCase(*defaultPath, selected->executablePath));
+        cpp_unit::LogMessage(L"http selected via path -> progId=%ls", selected->progId.c_str());
+    }
+
+    // The looser, file-name-only form of the same selector.
+    TEST_METHOD(SelectingByFileNameMatchesRegardlessOfDirectory)
+    {
+        const auto defaultPath = TryGetUriSchemeHandlerExecutablePath(L"http");
+        cpp_unit::Assert::IsTrue(defaultPath.has_value());
+        const auto fileName = std::wstring(GetFileNamePart(*defaultPath));
+
+        const auto selected =
+            TryFindUriSchemeHandler(L"http", UriHandlerSelection::ByExecutableFileName(fileName));
+        cpp_unit::Assert::IsTrue(selected.has_value());
+    }
+
+    // A selector naming nothing registered is an ordinary "not found" - the caller asked
+    // for an app that is not installed, which is not a machine error.
+    TEST_METHOD(SelectingAnUnregisteredExecutableFindsNothing)
+    {
+        const auto selected = TryFindUriSchemeHandler(
+            L"http", UriHandlerSelection::ByExecutablePath(LR"(C:\not-a-registered-handler.exe)"));
+        cpp_unit::Assert::IsFalse(selected.has_value());
+    }
+
+    TEST_METHOD(SelectingAnUnregisteredAppUserModelIdFindsNothing)
+    {
+        const auto selected = TryFindUriSchemeHandler(
+            L"http", UriHandlerSelection::ByAppUserModelId(L"Not.A.Real.Package_1234!App"));
+        cpp_unit::Assert::IsFalse(selected.has_value());
+    }
+
+    // The default selector is a no-op by design - callers that don't want to pick a
+    // specific app should never see the enumeration path at all.
+    TEST_METHOD(DefaultSelectionDoesNotEnumerate)
+    {
+        cpp_unit::Assert::IsFalse(TryFindUriSchemeHandler(L"http", UriHandlerSelection::Default()).has_value());
+    }
+
+    // ResolveTargetedUriLaunch integration: a selection that resolves stands in for the
+    // default association lookup, and is then judged by the policy like any other target.
+    TEST_METHOD(ResolvedSelectionIsValidatedAgainstThePolicy)
+    {
+        const auto defaultPath = TryGetUriSchemeHandlerExecutablePath(L"http");
+        cpp_unit::Assert::IsTrue(defaultPath.has_value());
+
+        const auto policy = LaunchTargetPolicy::RequireExecutablePath(*defaultPath);
+        const auto selection = UriHandlerSelection::ByExecutablePath(*defaultPath);
+
+        const auto decision = ResolveTargetedUriLaunch(
+            L"http://example.com", policy, std::nullopt, selection);
+        cpp_unit::Assert::IsTrue(decision.status == LaunchTargetStatus::Allowed);
+        cpp_unit::Assert::IsTrue(EqualsIgnoreCase(*defaultPath, decision.target.executablePath));
+    }
+
+    // A selection that names a real registered path but a *different* one than the
+    // policy requires is Refused, not Allowed - selecting an app does not bypass the
+    // policy, it only changes which target the policy is evaluated against.
+    TEST_METHOD(ResolvedSelectionCanStillBeRefused)
+    {
+        const auto defaultPath = TryGetUriSchemeHandlerExecutablePath(L"http");
+        cpp_unit::Assert::IsTrue(defaultPath.has_value());
+
+        const auto policy = LaunchTargetPolicy::RequireExecutablePath(LR"(C:\some-other-required-handler.exe)");
+        const auto selection = UriHandlerSelection::ByExecutablePath(*defaultPath);
+
+        const auto decision = ResolveTargetedUriLaunch(
+            L"http://example.com", policy, std::nullopt, selection);
+        cpp_unit::Assert::IsTrue(decision.status == LaunchTargetStatus::Refused);
+    }
+
+    // A selection naming an app that is not registered at all is NoHandler - the caller
+    // asked for a specific app, so "fall back to the default" would be the wrong answer.
+    TEST_METHOD(UnresolvableSelectionIsNoHandlerRegardlessOfPolicy)
+    {
+        const auto selection = UriHandlerSelection::ByExecutablePath(LR"(C:\not-a-registered-handler.exe)");
+
+        const auto decision = ResolveTargetedUriLaunch(
+            L"http://example.com", LaunchTargetPolicy::Unconstrained(), std::nullopt, selection);
+        cpp_unit::Assert::IsTrue(decision.status == LaunchTargetStatus::NoHandler);
+    }
+
+    // End to end, against whatever is really installed, without ever launching anything.
+    // The tests above prove the mechanism against the *default* handler, which every
+    // machine has exactly one of - that alone cannot prove the non-default case works,
+    // because selecting the default proves nothing about picking one *among several*.
+    // This instead looks for a scheme with genuine contention (more than one application
+    // registered - commonly http/https, with more than one browser installed, or mailto,
+    // with a browser and a mail client both registered) and selects an alternative to
+    // the default. Both ResolveTargetedUriLaunch and LaunchUriWithTarget's dry run stop
+    // before ShellExecuteExW is ever reached, so this proves the selection resolves to
+    // the *other* app without spawning either one.
+    TEST_METHOD(SelectingARealNonDefaultHandlerResolvesWithoutLaunching)
+    {
+        static constexpr PCWSTR candidateSchemes[] = { L"http", L"https", L"mailto" };
+
+        for (auto scheme : candidateSchemes)
+        {
+            const auto defaultPath = TryGetUriSchemeHandlerExecutablePath(scheme);
+            if (!defaultPath)
+            {
+                continue;
+            }
+            const auto defaultFileName = std::wstring(GetFileNamePart(*defaultPath));
+
+            wil::com_ptr<IEnumAssocHandlers> enumHandlers;
+            if (FAILED(SHAssocEnumHandlersForProtocolByApplication(scheme, IID_PPV_ARGS(&enumHandlers))))
+            {
+                continue;
+            }
+
+            wil::com_ptr<IAssocHandler> handler;
+            ULONG fetched = 0;
+            while ((enumHandlers->Next(1, handler.put(), &fetched) == S_OK) && (fetched == 1))
+            {
+                auto current = std::move(handler);
+                handler = nullptr;
+
+                wil::unique_cotaskmem_string name;
+                if (FAILED(current->GetName(&name)))
+                {
+                    continue;
+                }
+                const std::wstring_view nameView{name.get()};
+
+                // A packaged handler's GetName() is an AUMID ("PackageFamilyName!AppId"),
+                // which always contains '!'; this is test-only discovery of *which kind*
+                // of identifier was enumerated, not the production matching logic above
+                // (which never needs to guess, because the selector already says).
+                const bool isAumid = nameView.find(L'!') != std::wstring_view::npos;
+
+                // Skip the default itself - the point is to find a genuine *alternative*.
+                if (!isAumid && EqualsIgnoreCase(GetFileNamePart(nameView), defaultFileName))
+                {
+                    continue;
+                }
+
+                const auto selection = isAumid
+                    ? UriHandlerSelection::ByAppUserModelId(std::wstring(nameView))
+                    : UriHandlerSelection::ByExecutablePath(std::wstring(nameView));
+                const std::wstring uri = std::wstring(scheme) + L"://ignored";
+
+                const auto decision = ResolveTargetedUriLaunch(
+                    uri.c_str(), LaunchTargetPolicy::Unconstrained(), std::nullopt, selection);
+                cpp_unit::Assert::IsTrue(decision.status == LaunchTargetStatus::Allowed,
+                    L"a real, registered non-default handler failed to resolve");
+
+                if (isAumid)
+                {
+                    cpp_unit::Assert::IsFalse(decision.target.packageFamilyName.empty());
+                }
+                else
+                {
+                    cpp_unit::Assert::IsTrue(EqualsIgnoreCase(decision.target.executablePath, nameView));
+                    cpp_unit::Assert::IsFalse(
+                        EqualsIgnoreCase(GetFileNamePart(decision.target.executablePath), defaultFileName),
+                        L"the resolved target should differ from the scheme's default handler");
+                }
+
+                // Same selection through the dry-run entry point: 'dryRun' returns
+                // before ShellExecuteExW is ever called, so this is still launch-nothing.
+                const auto dryRunStatus = LaunchUriWithTarget(
+                    uri.c_str(), LaunchTargetPolicy::Unconstrained(), std::nullopt,
+                    /* dryRun */ true, selection);
+                cpp_unit::Assert::IsTrue(dryRunStatus == LaunchTargetStatus::Allowed);
+
+                cpp_unit::LogMessage(L"%ls: selected non-default handler %.*ls (default was %ls)",
+                    scheme, static_cast<int>(nameView.size()), nameView.data(), defaultFileName.c_str());
+                return;   // one confirmed case across all candidate schemes is enough
+            }
+        }
+
+        cpp_unit::Logger::WriteMessage(
+            L"skipped - none of http/https/mailto had more than one registered handler on this machine");
     }
 };
 
@@ -809,9 +1024,11 @@ public:
         const auto policy = LaunchTargetPolicy::PinToProcess(GetCurrentProcessIdentity());
 
         // Not a dry run: the call is refused by the policy, so ShellExecuteExW is never
-        // reached.
-        cpp_unit::Assert::AreEqual(E_ACCESSDENIED,
-            LaunchUriWithTarget(L"local+app-response:result", policy, otherIdentity, /* dryRun */ false));
+        // reached. Refusal is a status, not an exception - the mitigation firing is an
+        // ordinary outcome to check for, not a caller bug.
+        cpp_unit::Assert::IsTrue(
+            LaunchUriWithTarget(L"local+app-response:result", policy, otherIdentity, /* dryRun */ false)
+                == LaunchTargetStatus::Refused);
     }
 };
 
@@ -831,10 +1048,8 @@ public:
     {
         auto apartment = wil::CoInitializeEx(COINIT_APARTMENTTHREADED);
 
-        LaunchSiteObservations observations;
-        const HRESULT hr = ProbeUriLaunchTarget(L"http://example.com", observations);
+        const auto observations = ProbeUriLaunchTarget(L"http://example.com");
 
-        cpp_unit::Assert::AreEqual(S_OK, hr, L"the probe never reached a handler decision");
         cpp_unit::Assert::IsTrue(observations.probeCancelled, L"a probe must always cancel");
 
         cpp_unit::LogMessage(L"probe: createProcess=%d coCreate=%d",
@@ -852,26 +1067,26 @@ public:
     {
         auto apartment = wil::CoInitializeEx(COINIT_APARTMENTTHREADED);
 
-        ResolvedLaunchTarget probed;
-        cpp_unit::Assert::AreEqual(S_OK, ProbeResolvedLaunchTarget(L"http://example.com", probed));
+        const auto probed = ProbeResolvedLaunchTarget(L"http://example.com");
+        cpp_unit::Assert::IsTrue(probed.has_value(), L"the probe never reached a handler decision");
 
         // Fully expanded: a real, rooted path with no unexpanded environment variable.
-        cpp_unit::Assert::AreEqual(std::wstring::npos, probed.executablePath.find(L'%'),
+        cpp_unit::Assert::AreEqual(std::wstring::npos, probed->executablePath.find(L'%'),
             L"the probed path still contains an unexpanded variable");
-        cpp_unit::Assert::AreNotEqual(std::wstring::npos, probed.executablePath.find(L':'),
+        cpp_unit::Assert::AreNotEqual(std::wstring::npos, probed->executablePath.find(L':'),
             L"the probed path is not rooted");
 
         const auto associationPath = TryGetUriSchemeHandlerExecutablePath(L"http");
         if (associationPath)
         {
-            cpp_unit::LogMessage(L"probe:       %ls", probed.executablePath.c_str());
+            cpp_unit::LogMessage(L"probe:       %ls", probed->executablePath.c_str());
             cpp_unit::LogMessage(L"association: %ls", associationPath->c_str());
 
             // Both should name the same binary. The file name is compared rather than
             // the full path: the two resolutions can legitimately differ in casing or
             // in which registered path form they report.
             cpp_unit::Assert::IsTrue(
-                EqualsIgnoreCase(GetFileNamePart(probed.executablePath), GetFileNamePart(*associationPath)),
+                EqualsIgnoreCase(GetFileNamePart(probed->executablePath), GetFileNamePart(*associationPath)),
                 L"the probe and the association query named different binaries");
         }
     }
@@ -882,13 +1097,13 @@ public:
     {
         auto apartment = wil::CoInitializeEx(COINIT_APARTMENTTHREADED);
 
-        ResolvedLaunchTarget probed;
-        cpp_unit::Assert::AreEqual(S_OK, ProbeResolvedLaunchTarget(L"http://example.com", probed));
+        const auto probed = ProbeResolvedLaunchTarget(L"http://example.com");
+        cpp_unit::Assert::IsTrue(probed.has_value(), L"the probe never reached a handler decision");
 
         cpp_unit::Assert::AreEqual(S_OK,
-            LaunchTargetPolicy::RequireExecutablePath(probed.executablePath).Validate(probed));
+            LaunchTargetPolicy::RequireExecutablePath(probed->executablePath).Validate(*probed));
         cpp_unit::Assert::AreEqual(E_ACCESSDENIED,
-            LaunchTargetPolicy::RequireExecutablePath(LR"(C:\somewhere-else.exe)").Validate(probed));
+            LaunchTargetPolicy::RequireExecutablePath(LR"(C:\somewhere-else.exe)").Validate(*probed));
     }
 
     // A violated constraint cancels the launch from inside ShellExecuteExW, and the
@@ -900,9 +1115,10 @@ public:
         LaunchSiteObservations observations;
         const auto policy = LaunchTargetPolicy::RequireExecutablePath(LR"(C:\not-the-registered-handler.exe)");
 
-        const HRESULT hr = LaunchUriWithSiteEnforcedTarget(L"http://example.com", policy, &observations);
+        const auto status = LaunchUriWithSiteEnforcedTarget(L"http://example.com", policy, &observations);
 
-        cpp_unit::Assert::AreEqual(E_ACCESSDENIED, hr, L"the launch was not cancelled by the policy");
+        cpp_unit::Assert::IsTrue(status == LaunchTargetStatus::Refused,
+            L"the launch was not cancelled by the policy");
         cpp_unit::Assert::AreEqual(E_ACCESSDENIED, observations.decision);
         cpp_unit::LogMessage(L"refused: %ls", observations.applicationPath.c_str());
     }
@@ -913,20 +1129,20 @@ public:
     {
         auto apartment = wil::CoInitializeEx(COINIT_APARTMENTTHREADED);
 
-        ResolvedLaunchTarget probed;
-        cpp_unit::Assert::AreEqual(S_OK, ProbeResolvedLaunchTarget(L"http://example.com", probed));
-        const std::wstring resolvedFileName(GetFileNamePart(probed.executablePath));
+        const auto probed = ProbeResolvedLaunchTarget(L"http://example.com");
+        cpp_unit::Assert::IsTrue(probed.has_value(), L"the probe never reached a handler decision");
+        const std::wstring resolvedFileName(GetFileNamePart(probed->executablePath));
 
         LaunchSiteObservations observations;
-        cpp_unit::Assert::AreEqual(E_ACCESSDENIED,
-            LaunchUriWithSiteEnforcedTarget(L"http://example.com",
-                LaunchTargetPolicy::RequireExecutableFileName(L"a-different-handler.exe"), &observations),
+        const auto status = LaunchUriWithSiteEnforcedTarget(L"http://example.com",
+            LaunchTargetPolicy::RequireExecutableFileName(L"a-different-handler.exe"), &observations);
+        cpp_unit::Assert::IsTrue(status == LaunchTargetStatus::Refused,
             L"a launch pinned to a different file name should have been cancelled");
 
         // The permitted case is only asserted as a policy decision - actually letting it
         // through would open a browser window during the test run.
         cpp_unit::Assert::AreEqual(S_OK,
-            LaunchTargetPolicy::RequireExecutableFileName(resolvedFileName).Validate(probed));
+            LaunchTargetPolicy::RequireExecutableFileName(resolvedFileName).Validate(*probed));
     }
 
     // A packaged verb's own registration (HKCR\AppX.../shell/<verb>) carries an
@@ -937,26 +1153,25 @@ public:
     {
         auto apartment = wil::CoInitializeEx(COINIT_APARTMENTTHREADED);
 
-        ResolvedLaunchTarget probed;
-        const HRESULT probeHr = ProbeResolvedLaunchTarget(L"ms-settings:", probed);
-        if (FAILED(probeHr) || probed.packageFamilyName.empty())
+        const auto probed = ProbeResolvedLaunchTarget(L"ms-settings:");
+        if (!probed || probed->packageFamilyName.empty())
         {
             cpp_unit::Logger::WriteMessage(L"skipped - ms-settings did not probe to a packaged handler");
             return;
         }
 
-        cpp_unit::LogMessage(L"probed package family: %ls", probed.packageFamilyName.c_str());
+        cpp_unit::LogMessage(L"probed package family: %ls", probed->packageFamilyName.c_str());
 
         LaunchSiteObservations observations;
-        cpp_unit::Assert::AreEqual(E_ACCESSDENIED,
-            LaunchUriWithSiteEnforcedTarget(L"ms-settings:",
-                LaunchTargetPolicy::RequirePackageFamilyName(L"Not.The.Right.Family_12345"), &observations),
+        const auto status = LaunchUriWithSiteEnforcedTarget(L"ms-settings:",
+            LaunchTargetPolicy::RequirePackageFamilyName(L"Not.The.Right.Family_12345"), &observations);
+        cpp_unit::Assert::IsTrue(status == LaunchTargetStatus::Refused,
             L"a launch pinned to the wrong package family should have been cancelled");
 
         // The permitted case is asserted as a policy decision only, to avoid actually
         // opening the Settings app during the test run.
         cpp_unit::Assert::AreEqual(S_OK,
-            LaunchTargetPolicy::RequirePackageFamilyName(probed.packageFamilyName).Validate(probed));
+            LaunchTargetPolicy::RequirePackageFamilyName(probed->packageFamilyName).Validate(*probed));
     }
 };
 
@@ -1001,8 +1216,9 @@ public:
         // refusal, not as an absence of constraint.
         TEST_METHOD(InProcServerResolvesToADllAndYieldsNoEnforceablePath)
         {
-            ComServerBinary server;
-            cpp_unit::Assert::AreEqual(S_OK, GetComServerBinaryFromClsid(CLSID_ShellLink, server));
+            const auto resolved = TryGetComServerBinaryFromClsid(CLSID_ShellLink);
+            cpp_unit::Assert::IsTrue(resolved.has_value());
+            const auto& server = *resolved;
 
             cpp_unit::LogMessage(L"CLSID_ShellLink -> %ls  %ls", HostingName(server.hosting), server.binaryPath.c_str());
 
@@ -1026,10 +1242,7 @@ public:
             GUID unregistered{};
             THROW_IF_FAILED(CoCreateGuid(&unregistered));
 
-            ComServerBinary server;
-            cpp_unit::Assert::AreNotEqual(S_OK, GetComServerBinaryFromClsid(unregistered, server));
-            cpp_unit::Assert::IsTrue(server.hosting == ComServerHosting::None);
-            cpp_unit::Assert::IsTrue(server.PathToEnforce().empty());
+            cpp_unit::Assert::IsFalse(TryGetComServerBinaryFromClsid(unregistered).has_value());
         }
 
         // Classic COM: find a real LocalServer32 class on this machine and confirm it
@@ -1055,12 +1268,12 @@ public:
                     continue;
                 }
 
-                ComServerBinary server;
-                if (FAILED(GetComServerBinaryFromClsid(clsid, server)) ||
-                    (server.hosting != ComServerHosting::LocalServer))
+                const auto resolved = TryGetComServerBinaryFromClsid(clsid);
+                if (!resolved || (resolved->hosting != ComServerHosting::LocalServer))
                 {
                     continue;
                 }
+                const auto& server = *resolved;
 
                 found = true;
                 cpp_unit::LogMessage(L"%ls -> %ls  %ls", name, HostingName(server.hosting), server.binaryPath.c_str());
@@ -1114,16 +1327,16 @@ public:
                     continue;
                 }
 
-                ComServerBinary server;
-                const HRESULT hr = GetComServerBinaryFromClsid(clsid, server);
-                if (FAILED(hr))
+                const auto resolved = TryGetComServerBinaryFromClsid(clsid);
+                if (!resolved)
                 {
                     if (i < 3)
                     {
-                        cpp_unit::LogMessage(L"%ls failed 0x%08X", name, hr);
+                        cpp_unit::LogMessage(L"%ls not resolved", name);
                     }
                     continue;
                 }
+                const auto& server = *resolved;
                 if (!server.IsPackaged())
                 {
                     continue;   // also skips classes that a classic registration answered first
@@ -1196,21 +1409,17 @@ public:
         }
         ++tally.examined;
 
-        ComServerBinary server;
-        const HRESULT hr = GetComServerBinaryFromClsid(clsid, server);
+        const auto resolved = TryGetComServerBinaryFromClsid(clsid);
 
-        if (FAILED(hr))
+        if (!resolved)
         {
-            // A lookup that cannot answer must say so and leave nothing behind. An
-            // empty-but-successful result is the dangerous failure mode: a policy would
-            // compare against "" and could be talked into matching.
+            // A lookup that cannot answer must say so and leave nothing behind - there is
+            // no leftover result to inspect, which is the whole point of returning
+            // std::optional rather than an out-param a caller could half-fill.
             ++tally.failed;
-            cpp_unit::Assert::IsTrue(server.hosting == ComServerHosting::None,
-                (std::wstring(L"failed lookup left a hosting kind: ") + clsidText).c_str());
-            cpp_unit::Assert::IsTrue(server.PathToEnforce().empty(),
-                (std::wstring(L"failed lookup left a path to enforce: ") + clsidText).c_str());
             return;
         }
+        const auto& server = *resolved;
 
         ++tally.resolved;
         switch (server.hosting)
@@ -1265,12 +1474,12 @@ public:
 
         // Determinism: the same class must resolve the same way every time. Enumeration
         // order, registry view, or a first-match-wins scan must not leak into the answer.
-        ComServerBinary again;
-        cpp_unit::Assert::AreEqual(S_OK, GetComServerBinaryFromClsid(clsid, again),
+        const auto again = TryGetComServerBinaryFromClsid(clsid);
+        cpp_unit::Assert::IsTrue(again.has_value(),
             (std::wstring(L"second lookup failed: ") + clsidText).c_str());
-        cpp_unit::Assert::IsTrue(again.hosting == server.hosting,
+        cpp_unit::Assert::IsTrue(again->hosting == server.hosting,
             (std::wstring(L"unstable hosting kind: ") + clsidText).c_str());
-        cpp_unit::Assert::AreEqual(enforce, again.PathToEnforce(),
+        cpp_unit::Assert::AreEqual(enforce, again->PathToEnforce(),
             (std::wstring(L"unstable path to enforce: ") + clsidText).c_str());
     }
 

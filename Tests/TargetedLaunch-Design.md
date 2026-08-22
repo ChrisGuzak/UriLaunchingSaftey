@@ -216,19 +216,32 @@ identity capture returns `std::optional<ProcessIdentity>`, where the empty case 
 expected, and resolution returns a `TargetedLaunchDecision` carrying an explicit status:
 
 ```
-Allowed | Refused | Unverifiable | NoHandler | NoLiveTarget
+Allowed | Refused | Unverifiable | NoHandler | NoLiveTarget | LaunchFailed
 ```
 
-`Refused` (the mitigation firing) is deliberately distinct from the failure statuses, so
-"we stopped it" is never confused with "it broke".
+`Refused` (the mitigation firing) is deliberately distinct from `LaunchFailed` (the OS
+itself could not start the resolved, policy-accepted target - a missing file, a
+half-uninstalled handler), so "we stopped it" is never confused with "it broke" - and
+both are distinct from `NoHandler`/`NoLiveTarget` (there was nothing to judge in the
+first place). Every top-level entry point in this header - `ResolveTargetedUriLaunch`,
+`LaunchUriWithTarget`, `LaunchUriWithSiteEnforcedTarget`, `ProbeUriLaunchTarget`,
+`ProbeResolvedLaunchTarget` - reports outcomes through this same status (or an
+`std::optional`/`std::nullopt` built from it), never by throwing. A missing or
+misconfigured app registration, a cancelled site chain, or a failed `ShellExecuteExW`
+call are exactly the conditions this library exists to defend a caller against, and a
+library that throws on the very inputs it is meant to make safe would force every caller
+to wrap it in a `try`/`catch` just to stay defended - worse than the unchecked-HRESULT
+problem it replaces.
 
-What is *not* in that set is just as deliberate. A null or scheme-less uri throws, because
-the uri is the caller's own argument rather than something the machine reported: these
-statuses classify what could be answered about a well-formed request, and admitting a
-caller bug into that set would let it read as a security outcome. `LaunchUriWithTarget`
-returns `E_INVALIDARG` for the same condition, which is how an HRESULT-returning entry
-point states it. A violated compile-time packaging assertion fails fast, for the same
-reason: it means the code was built for the wrong shape of peer.
+What *is* still worth throwing for is different in kind: a null or scheme-less uri is the
+caller's own argument, not something the machine or an app's registration reported, so
+`ResolveTargetedUriLaunch` (and transitively `LaunchUriWithTarget`) throws
+`E_INVALIDARG` via `wil::ResultException` for it - admitting a caller bug into the status
+set above would let a programming error read as a security or environmental outcome.
+The only other thing allowed to propagate uncaught is a catastrophic failure such as
+`std::bad_alloc` - nothing in this header catches or converts those, by design. A
+violated compile-time packaging assertion fails fast for the same "this is a bug, not a
+runtime condition" reason: it means the code was built for the wrong shape of peer.
 
 ## The policy
 
@@ -246,6 +259,67 @@ Two comparison rules that are easy to get wrong:
   naming `c:\windows\system32\notepad.exe`.
 - File names are compared against the **file name component**, never as a string suffix -
   otherwise `explorer.exe` would be satisfied by `c:\evil\notexplorer.exe`.
+
+## Selecting a non-default handler
+
+Everything above *rejects* a wrong handler; none of it can *pick* a right one that isn't
+the scheme's default. `Windows.System.Launcher.LaunchUriAsync` has
+`LauncherOptions.PreferredApplicationPackageFamilyName` /
+`PreferredApplicationId` for exactly this - "launch this uri with *that* app, not
+whatever is registered as default." Classic `ShellExecute` has no such parameter, and
+`AssocQueryString`/`TryGetUriSchemeHandlerExecutablePath` can only ever answer "what is
+the default", never "is this other, non-default app also a legitimate registered choice."
+
+The fix asks the same association system a different question. `IAssocHandler`, reached
+through the public `SHAssocEnumHandlersForProtocolByApplication`, enumerates every
+application registered for a scheme - already deduplicated to one entry per app, the same
+list behind the shell's own "Open with" picker. A caller matches by whichever identifier
+it happens to have:
+
+| `UriHandlerSelector` | Identifies | Matched against |
+|---|---|---|
+| `AppUserModelId` | a packaged app, by AUMID | `IAssocHandler::GetName()`, when it contains `!` |
+| `ExecutablePath` | a classic handler, by full path | `IAssocHandler::GetName()`, when it does not |
+| `ExecutableFileName` | a classic handler, by file name only | the file name component of the same |
+| `ProgId` | any handler, by its association ProgId | `IObjectWithProgID::GetProgID()` |
+
+`GetName()` is the one primitive both shapes resolve through: for a classic handler it
+returns the full `.exe` path, for a packaged handler the AUMID
+(`PackageFamilyName!AppId`) - and a file system path can never contain `!`, which is what
+tells the two apart without a separate packaged/unpackaged branch.
+
+Once a handler is found, its ProgId is what actually drives the launch:
+`ShellExecuteExW`'s `SEE_MASK_CLASSNAME` / `lpClass` forces resolution to a specific
+class, exactly the mechanism the shell's own picker uses to launch a non-default app.
+That is also why this composes with the enforcement site chain for free - the site chain
+judges whatever the shell resolves the class to, and does not care whether the class
+came from the scheme's own default or from an override.
+
+`ResolveTargetedUriLaunch` takes a `UriHandlerSelection` alongside the policy: a
+selection is resolved once, up front, and if it names nothing currently registered that
+is `NoHandler` - "not installed" is a different, more specific answer than "resolves to
+the wrong thing," which is what `Refused` still means when a selection *does* resolve but
+the policy doesn't accept it. Selecting an app is not a way to bypass the policy; it only
+changes which target the policy is evaluated against.
+
+Selection is orthogonal to the two live-process policies (`ProcessIdAndSequence`,
+`PackageFamilyName`): those answer "is the launch reaching the peer I already know is
+running," which has nothing to do with which registered app it dispatches through, so a
+selection alongside either of those is simply ignored.
+
+Most of the selection tests prove the mechanism against a scheme's *default* handler,
+which every machine has exactly one of - that alone cannot prove picking a genuine
+non-default choice works, since selecting the only registered app proves nothing about
+choosing *among several*. `SelectingARealNonDefaultHandlerResolvesWithoutLaunching`
+instead looks at the real machine it runs on: it enumerates `http`/`https`/`mailto` (the
+schemes most likely to have more than one browser or mail client installed) until it
+finds one with genuine contention, selects whichever registered handler is not the
+default, and resolves it with `dryRun = true` - which returns after
+`ResolveTargetedUriLaunch` and before `ShellExecuteExW` is ever reached - so the test
+proves the non-default choice resolves correctly without spawning either application. If
+no candidate scheme has more than one handler on the machine running the test, it logs
+and skips rather than failing, since contention is a property of the machine, not of the
+resolver.
 
 ### Package-target policy
 
@@ -418,9 +492,12 @@ Two real bugs found here, both worth knowing about:
 
 ## Testing
 
-`Tests/TargetedLaunchTests.cpp` - 8 test classes covering each case above, including a
+`Tests/TargetedLaunchTests.cpp` - 9 test classes covering each case above, including a
 genuine cross-process COM call (a helper process binds via the ROT and calls in, proving
-the identity came from the wire).
+the identity came from the wire), and a dedicated class for handler selection
+(`TargetedLaunchHandlerSelection`) that resolves the machine's own default `http` handler
+back through the enumeration, by path, by file name, and confirms an unregistered
+selector is `NoHandler` rather than a silent fallback.
 
 A **sweep** runs every COM registration on the machine through the resolver (~7900 classic
 + ~170 packaged, under 2s). It asserts *invariants*, never specific paths, because the

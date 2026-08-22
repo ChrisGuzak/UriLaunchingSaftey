@@ -687,6 +687,214 @@ inline bool EqualsIgnoreCase(std::wstring_view left, std::wstring_view right) no
     return wil::compare_string_ordinal(left, right, true) == nullptr;
 }
 
+// Selecting among multiple registered handlers.
+//
+// Everything above answers "what is the *default* handler for this scheme" - the same
+// question ShellExecute itself answers. That is enough to reject a hijacker, but it
+// cannot pick a *non-default* handler that is nonetheless a legitimate, registered
+// choice: WinRT's Launcher.LaunchUriAsync has PreferredApplicationPackageFamilyName /
+// PreferredApplicationId for exactly this, and classic ShellExecute has no equivalent.
+//
+// The fix is the same association system, asked a different question:
+// SHAssocEnumHandlersForProtocolByApplication enumerates every application registered
+// for the scheme (already deduplicated to one entry per app - the same list the shell's
+// "Open with" picker shows), and the caller matches by whichever identifier it has:
+//   - AppUserModelId - the AUMID of a packaged app ("PackageFamilyName!AppId").
+//   - ExecutablePath / ExecutableFileName - a classic desktop handler, by full path or
+//     by file name only, mirroring the two granularities LaunchTargetPolicy already
+//     offers for pinning a launch.
+//   - ProgId - the association ProgId directly, for a caller that already knows it.
+//
+// IAssocHandler::GetName() is the single primitive both classic and packaged cases
+// resolve through: for a classic handler it returns the full .exe path; for a packaged
+// handler it returns the AUMID, which is why a '!' in the name is what tells the two
+// apart - a file system path can't contain one.
+enum class UriHandlerSelector
+{
+    Default,             // whatever the association system's default answers - status quo
+    ExecutablePath,      // a classic handler, by full path
+    ExecutableFileName,  // a classic handler, by file name only
+    AppUserModelId,      // a packaged handler, by AUMID ("PackageFamilyName!AppId")
+    ProgId,              // any handler, by its association ProgId
+};
+
+struct UriHandlerSelection
+{
+    UriHandlerSelector selector{UriHandlerSelector::Default};
+    std::wstring value;
+
+    static UriHandlerSelection Default() noexcept
+    {
+        return {};
+    }
+
+    static UriHandlerSelection ByExecutablePath(std::wstring path)
+    {
+        return {UriHandlerSelector::ExecutablePath, std::move(path)};
+    }
+
+    static UriHandlerSelection ByExecutableFileName(std::wstring fileName)
+    {
+        return {UriHandlerSelector::ExecutableFileName, std::move(fileName)};
+    }
+
+    static UriHandlerSelection ByAppUserModelId(std::wstring aumid)
+    {
+        return {UriHandlerSelector::AppUserModelId, std::move(aumid)};
+    }
+
+    static UriHandlerSelection ByProgId(std::wstring progId)
+    {
+        return {UriHandlerSelector::ProgId, std::move(progId)};
+    }
+
+    bool IsDefault() const noexcept
+    {
+        return selector == UriHandlerSelector::Default;
+    }
+};
+
+// What a selected handler resolves to: the ProgId that drives ShellExecuteExW's
+// SEE_MASK_CLASSNAME override, plus the same executablePath/packageFamilyName shape
+// ResolvedLaunchTarget already uses, so a selected handler can be validated by the same
+// LaunchTargetPolicy as the default one.
+struct ResolvedUriHandler
+{
+    std::wstring progId;
+    std::wstring executablePath;
+    std::wstring packageFamilyName;
+};
+
+namespace details
+{
+    // Does 'handler' match 'selection'? Each selector already states what kind of
+    // identifier it is comparing, so the comparison is decided by the selector alone -
+    // there is no need (and no reliable way) to guess the *shape* of GetName()'s answer
+    // from its content. In particular, a bare '!' check is not a safe test for "this is
+    // a packaged AUMID": packaged AUMIDs always contain one, but an unpackaged app can
+    // register an explicit AppUserModelID with no '!' at all (e.g. Word's real,
+    // unpackaged AppUserModelID is "Microsoft.Office.WINWORD.EXE.15") - so absence of
+    // '!' says nothing about whether the caller meant to select by path or by
+    // AppUserModelId.
+    inline bool UriHandlerMatchesSelection(IAssocHandler* handler, UriHandlerSelection const& selection) noexcept
+    {
+        if (selection.selector == UriHandlerSelector::ProgId)
+        {
+            wil::com_ptr<IObjectWithProgID> objectWithProgId;
+            wil::unique_cotaskmem_string progId;
+            return SUCCEEDED(handler->QueryInterface(IID_PPV_ARGS(&objectWithProgId))) &&
+                   SUCCEEDED(objectWithProgId->GetProgID(&progId)) &&
+                   EqualsIgnoreCase(selection.value, progId.get());
+        }
+
+        wil::unique_cotaskmem_string name;
+        if (FAILED(handler->GetName(&name)))
+        {
+            return false;
+        }
+        const std::wstring_view nameView{name.get()};
+
+        switch (selection.selector)
+        {
+        case UriHandlerSelector::AppUserModelId:
+        case UriHandlerSelector::ExecutablePath:
+            return EqualsIgnoreCase(selection.value, nameView);
+        case UriHandlerSelector::ExecutableFileName:
+            return EqualsIgnoreCase(GetFileNamePart(selection.value), GetFileNamePart(nameView));
+        default:
+            return false;
+        }
+    }
+
+    // Returns the executablePath/packageFamilyName half of a matched handler, layered
+    // onto whatever 'resolved' already carries (its progId). Which field to fill is
+    // taken from 'selection' - the same reasoning as above: the selector already says
+    // what kind of name this is, so there is nothing to detect. Only ProgId leaves it
+    // genuinely ambiguous (a ProgId can name either a packaged or classic handler), so
+    // that is the one case a '!' is used as a best-effort guess.
+    inline ResolvedUriHandler FillResolvedUriHandlerTarget(
+        IAssocHandler* handler, UriHandlerSelection const& selection, ResolvedUriHandler resolved) noexcept
+    {
+        wil::unique_cotaskmem_string name;
+        if (FAILED(handler->GetName(&name)))
+        {
+            return resolved;
+        }
+        const std::wstring_view nameView{name.get()};
+
+        switch (selection.selector)
+        {
+        case UriHandlerSelector::AppUserModelId:
+            resolved.packageFamilyName = std::wstring(nameView);
+            return resolved;
+        case UriHandlerSelector::ExecutablePath:
+        case UriHandlerSelector::ExecutableFileName:
+            resolved.executablePath = std::wstring(nameView);
+            return resolved;
+        default:
+            break;
+        }
+
+        // ProgId: the selector doesn't say which shape to expect, so fall back to the
+        // one distinguishing fact that does hold: a packaged AUMID always contains '!'.
+        const auto bang = nameView.find(L'!');
+        if (bang != std::wstring_view::npos)
+        {
+            resolved.packageFamilyName = std::wstring(nameView.substr(0, bang));
+        }
+        else
+        {
+            resolved.executablePath = std::wstring(nameView);
+        }
+        return resolved;
+    }
+} // namespace details
+
+// Find the one application, among every application registered for 'scheme', that
+// matches 'selection'. A Try, like the rest of association lookup: a selector that
+// names nothing currently registered is an ordinary "not found", not an error - the
+// selected app may simply not be installed.
+inline std::optional<ResolvedUriHandler> TryFindUriSchemeHandler(
+    PCWSTR scheme, UriHandlerSelection const& selection) noexcept
+{
+    if (selection.IsDefault())
+    {
+        return std::nullopt;
+    }
+
+    wil::com_ptr<IEnumAssocHandlers> enumHandlers;
+    if (FAILED(SHAssocEnumHandlersForProtocolByApplication(scheme, IID_PPV_ARGS(&enumHandlers))))
+    {
+        return std::nullopt;
+    }
+
+    wil::com_ptr<IAssocHandler> handler;
+    ULONG fetched = 0;
+    while ((enumHandlers->Next(1, handler.put(), &fetched) == S_OK) && (fetched == 1))
+    {
+        auto current = std::move(handler);
+        handler = nullptr;
+
+        if (details::UriHandlerMatchesSelection(current.get(), selection))
+        {
+            wil::com_ptr<IObjectWithProgID> objectWithProgId;
+            wil::unique_cotaskmem_string progId;
+            if (FAILED(current->QueryInterface(IID_PPV_ARGS(&objectWithProgId))) ||
+                FAILED(objectWithProgId->GetProgID(&progId)))
+            {
+                // No ProgId means nothing to hand ShellExecuteExW as SEE_MASK_CLASSNAME -
+                // this handler cannot be selected, even though it matched.
+                continue;
+            }
+
+            ResolvedUriHandler resolved;
+            resolved.progId = progId.get();
+            return details::FillResolvedUriHandlerTarget(current.get(), selection, std::move(resolved));
+        }
+    }
+    return std::nullopt;
+}
+
 // The policy.
 
 enum class LaunchTargetMatch
@@ -821,6 +1029,10 @@ enum class LaunchTargetStatus
     Unverifiable,       // the launch path did not expose the process needed by the policy
     NoHandler,          // the scheme has no registered handler
     NoLiveTarget,       // a live-process policy was given no peer identity
+    LaunchFailed,       // the policy accepted the target, but the OS-level launch itself
+                        // failed (a missing file, a half-uninstalled handler) - an
+                        // ordinary environmental outcome, not a caller bug, so it is a
+                        // status like the others rather than a thrown HRESULT
 };
 
 // The outcome of resolving a launch. Carries its own status, so "didn't resolve" is
@@ -843,15 +1055,20 @@ struct TargetedLaunchDecision
 
 struct LaunchSiteObservations;
 
-inline HRESULT LaunchUriWithSiteEnforcedTarget(
+inline LaunchTargetStatus LaunchUriWithSiteEnforcedTarget(
     PCWSTR uri,
     LaunchTargetPolicy const& policy,
     _Out_opt_ LaunchSiteObservations* observations,
-    bool untrustedSource) noexcept;
+    bool untrustedSource,
+    UriHandlerSelection const& handlerSelection = UriHandlerSelection::Default());
 
 // Resolve the uri's handler and check it against the policy *before* anything is
 // launched. 'liveTarget' supplies the peer process for ProcessIdAndSequence policies
 // (from the COM caller, the parent process, a HANDLE, an HWND, or an explicit pid).
+// 'handlerSelection' picks a specific registered app rather than the scheme's default -
+// see TryFindUriSchemeHandler above. It composes with the path-based policies (the
+// selected app still has to satisfy them), and is ignored for the live-process matches,
+// which are answered from 'liveTarget' rather than the registration.
 //
 // The uri is the caller's own argument, so a null or scheme-less one is a usage error and
 // throws. It is not a LaunchTargetStatus: the statuses classify what the machine could
@@ -860,7 +1077,8 @@ inline HRESULT LaunchUriWithSiteEnforcedTarget(
 inline TargetedLaunchDecision ResolveTargetedUriLaunch(
     PCWSTR uri,
     LaunchTargetPolicy const& policy,
-    std::optional<ProcessIdentity> const& liveTarget = std::nullopt)
+    std::optional<ProcessIdentity> const& liveTarget = std::nullopt,
+    UriHandlerSelection const& handlerSelection = UriHandlerSelection::Default())
 {
     THROW_HR_IF_NULL(E_INVALIDARG, uri);
     const std::wstring_view uriView{uri};
@@ -870,6 +1088,21 @@ inline TargetedLaunchDecision ResolveTargetedUriLaunch(
     try
     {
         TargetedLaunchDecision decision;
+        const std::wstring scheme(uriView.substr(0, colon));
+
+        // A caller-named app is resolved once, up front: if it names nothing currently
+        // registered for this scheme, that is NoHandler regardless of what the policy
+        // is - the caller asked for a specific app, not "whatever satisfies the policy".
+        std::optional<ResolvedUriHandler> selectedHandler;
+        if (!handlerSelection.IsDefault())
+        {
+            selectedHandler = TryFindUriSchemeHandler(scheme.c_str(), handlerSelection);
+            if (!selectedHandler)
+            {
+                decision.status = LaunchTargetStatus::NoHandler;
+                return decision;
+            }
+        }
 
         if ((policy.match == LaunchTargetMatch::ProcessIdAndSequence) ||
             (policy.match == LaunchTargetMatch::PackageFamilyName))
@@ -887,11 +1120,18 @@ inline TargetedLaunchDecision ResolveTargetedUriLaunch(
             decision.target.executablePath = liveTarget->executablePath;
             decision.target.packageFamilyName = liveTarget->packageFamilyName;
         }
+        else if (selectedHandler)
+        {
+            // The caller-selected handler stands in for the default association lookup
+            // below - it names exactly the app the launch was asked to invoke.
+            decision.target.executablePath = selectedHandler->executablePath;
+            decision.target.packageFamilyName = selectedHandler->packageFamilyName;
+            decision.target.runningProcess = liveTarget;
+        }
         else
         {
             // Path policies are answered by the association system: which .exe would
             // ShellExecute hand this uri to?
-            const std::wstring scheme(uriView.substr(0, colon));
             auto handlerPath = TryGetUriSchemeHandlerExecutablePath(scheme.c_str());
             if (!handlerPath)
             {
@@ -914,37 +1154,30 @@ inline TargetedLaunchDecision ResolveTargetedUriLaunch(
 }
 
 // Validate, then launch. 'dryRun' stops after validation so the decision can be tested
-// without spawning anything. Expected policy outcomes are HRESULTs from this Try-shaped
-// operation; callers that need the structured reason should call ResolveTargetedUriLaunch
-// first. A malformed uri is a usage error there; here it surfaces as E_INVALIDARG, which
-// is how an HRESULT-returning entry point states the same thing.
-inline HRESULT LaunchUriWithTarget(
+// without spawning anything. The result is a status, not a thrown exception: a refusal
+// or a missing handler is an ordinary registration-driven outcome - the same kind of
+// thing this mitigation exists to police - and a caller must be able to check for it
+// without a try/catch. Only a malformed uri throws, from ResolveTargetedUriLaunch, since
+// that is the caller's own usage error rather than anything the machine reported.
+inline LaunchTargetStatus LaunchUriWithTarget(
     PCWSTR uri,
     LaunchTargetPolicy const& policy,
     std::optional<ProcessIdentity> const& liveTarget = std::nullopt,
-    bool dryRun = false) noexcept try
+    bool dryRun = false,
+    UriHandlerSelection const& handlerSelection = UriHandlerSelection::Default())
 {
-    auto decision = ResolveTargetedUriLaunch(uri, policy, liveTarget);
-    switch (decision.status)
+    auto decision = ResolveTargetedUriLaunch(uri, policy, liveTarget, handlerSelection);
+    if (decision.status != LaunchTargetStatus::Allowed)
     {
-    case LaunchTargetStatus::Allowed:
-        break;
-    case LaunchTargetStatus::Refused:
-        return E_ACCESSDENIED;
-    case LaunchTargetStatus::NoLiveTarget:
-        return E_INVALIDARG;
-    case LaunchTargetStatus::NoHandler:
-    default:
-        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        return decision.status;
     }
     if (dryRun)
     {
-        return S_OK;
+        return LaunchTargetStatus::Allowed;
     }
 
-    return LaunchUriWithSiteEnforcedTarget(uri, policy, nullptr, false);
+    return LaunchUriWithSiteEnforcedTarget(uri, policy, nullptr, false, handlerSelection);
 }
-CATCH_RETURN()
 
 // Enforcing the policy inside ShellExecuteExW, via the site chain.
 //
@@ -1291,15 +1524,22 @@ namespace details
 // LocalServer32 / PackagedExe are the cases that matter - an out-of-process handler has
 // its own .exe, which is exactly what the path policies describe. In-proc servers are
 // reported for completeness but yield no enforceable path unless a surrogate hosts them.
-inline HRESULT GetComServerBinaryFromClsid(REFCLSID clsid, _Out_ ComServerBinary& server) noexcept try
+//
+// An unresolvable CLSID is an ordinary answer, not an error - most CLSIDs on a machine
+// are not what a caller is looking for, and a sweep across the registry (see the tests)
+// makes that the common case rather than the exception. So this is a Try, like the
+// uri-scheme resolver above, rather than an HRESULT a caller would have to check.
+inline std::optional<ComServerBinary> TryGetComServerBinaryFromClsid(REFCLSID clsid) noexcept try
 {
-    server = {};
+    ComServerBinary server;
 
     wchar_t clsidText[64]{};
-    RETURN_HR_IF(E_UNEXPECTED, StringFromGUID2(clsid, clsidText, ARRAYSIZE(clsidText)) == 0);
+    if (StringFromGUID2(clsid, clsidText, ARRAYSIZE(clsidText)) == 0)
+    {
+        return std::nullopt;
+    }
 
     // The class's AppID, when present, is what carries surrogate and identity config.
-    std::wstring appId;
     if (const auto value = details::TryReadClassRegistryString(clsidText, nullptr, L"AppID"))
     {
         server.appId = *value;
@@ -1309,7 +1549,7 @@ inline HRESULT GetComServerBinaryFromClsid(REFCLSID clsid, _Out_ ComServerBinary
     {
         server.hosting = ComServerHosting::LocalServer;
         server.binaryPath = details::ExtractExecutableFromCommand(*registered);
-        return S_OK;
+        return server;
     }
 
     if (const auto registered = details::TryReadClassRegistryString(clsidText, L"InProcServer32", nullptr))
@@ -1327,7 +1567,7 @@ inline HRESULT GetComServerBinaryFromClsid(REFCLSID clsid, _Out_ ComServerBinary
                 server.hosting = ComServerHosting::Surrogate;
             }
         }
-        return S_OK;
+        return server;
     }
 
     // Not classic - try packaged. The packaged lookup sets its own AppID when the class
@@ -1339,12 +1579,15 @@ inline HRESULT GetComServerBinaryFromClsid(REFCLSID clsid, _Out_ ComServerBinary
         {
             server.appId = savedAppId;
         }
-        return S_OK;
+        return server;
     }
 
-    RETURN_HR(HRESULT_FROM_WIN32(ERROR_NOT_FOUND));
+    return std::nullopt;
 }
-CATCH_RETURN();
+catch (...)
+{
+    return std::nullopt;
+}
 
 // Read the LocalOnly marker off the handler that is about to be invoked. IHandlerInfo's
 // association object describes *that* handler, so this answers the per-handler question
@@ -1435,12 +1678,11 @@ public:
         m_observations->handlerClsid = clsidHandler;
         m_observations->handlerIsLocalOnly = IsHandlerLocalOnly(handlerInfo);
 
-        ComServerBinary server;
-        const bool resolved = SUCCEEDED(GetComServerBinaryFromClsid(clsidHandler, server));
-        m_observations->comServer = server;
+        auto server = TryGetComServerBinaryFromClsid(clsidHandler);
+        m_observations->comServer = server.value_or(ComServerBinary{});
 
         ResolvedLaunchTarget target;
-        target.executablePath = resolved ? server.PathToEnforce() : std::wstring{};
+        target.executablePath = server ? server->PathToEnforce() : std::wstring{};
         m_observations->applicationPath = target.executablePath;
         if (auto packageFamilyName = TryGetHandlerPackageFamilyName(handlerInfo))
         {
@@ -1553,12 +1795,26 @@ private:
 // Launch a uri with the policy enforced from inside ShellExecuteExW. Unlike
 // LaunchUriWithTarget, the constraint is checked against the shell's own resolved
 // target. SEE_MASK_NOASYNC keeps the callbacks on this thread and makes the cancellation
-// failure observable in the return value.
-inline HRESULT LaunchUriWithSiteEnforcedTarget(
+// observable before this returns. The result is a status, not a thrown HRESULT: a
+// refusal, a vanished handler selection, or an OS-level launch failure are all ordinary
+// registration- or environment-driven outcomes - exactly what a caller must be able to
+// check without a try/catch, since the whole point of this mitigation is defending
+// against a bad or hostile app registration, not treating one as a programming error.
+// 'observations->decision' carries the underlying HRESULT for a caller that wants the
+// detail (which callback cancelled it, or the raw Win32 launch failure).
+//
+// 'handlerSelection' asks ShellExecuteExW to resolve a specific registered app instead
+// of the scheme's default, via SEE_MASK_CLASSNAME/lpClass - the same mechanism the
+// shell's own "Open with" picker uses to force a non-default choice. It is resolved to a
+// ProgId independently here, immediately before the call: that keeps this function's only
+// job as "drive ShellExecuteExW", and the resolution is authoritative anyway, since the
+// site chain below still judges whatever the shell actually does with it.
+inline LaunchTargetStatus LaunchUriWithSiteEnforcedTarget(
     PCWSTR uri,
     LaunchTargetPolicy const& policy,
     _Out_opt_ LaunchSiteObservations* observations = nullptr,
-    bool untrustedSource = false) noexcept try
+    bool untrustedSource = false,
+    UriHandlerSelection const& handlerSelection)
 {
     LaunchSiteObservations local;
     auto& sink = observations ? *observations : local;
@@ -1573,20 +1829,54 @@ inline HRESULT LaunchUriWithSiteEnforcedTarget(
     info.nShow = SW_NORMAL;
     info.hInstApp = reinterpret_cast<HINSTANCE>(site->GetAsSite());
 
+    std::optional<ResolvedUriHandler> selectedHandler;
+    if (!handlerSelection.IsDefault())
+    {
+        const std::wstring_view uriView{uri};
+        const auto colon = uriView.find(L':');
+        if (colon != std::wstring_view::npos)
+        {
+            const std::wstring scheme(uriView.substr(0, colon));
+            selectedHandler = TryFindUriSchemeHandler(scheme.c_str(), handlerSelection);
+        }
+        // Not found here is not a fresh failure - ResolveTargetedUriLaunch already
+        // rejected an unresolvable selection with NoHandler before this was ever called.
+        // Falling through to the default here would silently launch the wrong app, so a
+        // vanished selection instead fails the same way an unregistered scheme does: a
+        // status, since the registration changing underneath the caller is an ordinary
+        // race, not a bug in the caller's own code.
+        if (!selectedHandler || selectedHandler->progId.empty())
+        {
+            sink.decision = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+            return LaunchTargetStatus::NoHandler;
+        }
+        info.fMask |= SEE_MASK_CLASSNAME;
+        info.lpClass = selectedHandler->progId.c_str();
+    }
+
     if (!ShellExecuteExW(&info))
     {
         // A cancellation is reported as our own decision, not as a generic shell error,
-        // so callers can tell "policy refused this" from "the launch failed".
-        RETURN_HR_IF(sink.decision, FAILED(sink.decision));
-        RETURN_LAST_ERROR();
+        // so callers can tell "policy refused this" from "the launch failed". Either way
+        // this is an environmental outcome - a missing file, a half-uninstalled handler,
+        // or the mitigation firing - not a programming error, so it is a status rather
+        // than an exception.
+        if (FAILED(sink.decision))
+        {
+            return LaunchTargetStatus::Refused;
+        }
+        sink.decision = HRESULT_FROM_WIN32(GetLastError());
+        return LaunchTargetStatus::LaunchFailed;
     }
 
     // The shell can report success even though a callback failed; treat the recorded
     // decision as authoritative so a refusal is never reported as a successful launch.
-    RETURN_HR_IF(sink.decision, FAILED(sink.decision));
-    return S_OK;
+    if (FAILED(sink.decision))
+    {
+        return LaunchTargetStatus::Refused;
+    }
+    return LaunchTargetStatus::Allowed;
 }
-CATCH_RETURN();
 
 // Probe: run a *fake* launch purely to discover what the shell would do.
 //
@@ -1600,9 +1890,13 @@ CATCH_RETURN();
 // to it, and only then launch. The launch itself should still carry an enforcing site -
 // the probe's answer is a separate resolution and can go stale between the two calls
 // (the same TOCTOU gap that makes the enforcing site the authoritative check).
-inline HRESULT ProbeUriLaunchTarget(PCWSTR uri, _Out_ LaunchSiteObservations& observations) noexcept try
+//
+// An unregistered scheme is an ordinary probe answer, not a failure: 'probeCancelled'
+// tells the caller whether the shell reached a handler decision at all, so this returns
+// the observations unconditionally rather than throwing for "nothing to report".
+inline LaunchSiteObservations ProbeUriLaunchTarget(PCWSTR uri)
 {
-    observations = {};
+    LaunchSiteObservations observations;
 
     auto site = winrt::make_self<TargetedLaunchSite>(
         LaunchTargetPolicy::Unconstrained(), &observations, LaunchSiteMode::Probe);
@@ -1617,23 +1911,24 @@ inline HRESULT ProbeUriLaunchTarget(PCWSTR uri, _Out_ LaunchSiteObservations& ob
 
     ShellExecuteExW(&info);
 
-    // A probe that reached a callback has succeeded at its job, even though the launch
-    // it rode in on was deliberately failed. Not reaching one means the shell never got
-    // as far as choosing a handler - there is nothing to report.
-    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_NOT_FOUND), !observations.probeCancelled);
-    return S_OK;
+    return observations;
 }
-CATCH_RETURN();
 
 // The probe answer expressed as a target, so it can be fed to a policy directly.
-inline HRESULT ProbeResolvedLaunchTarget(PCWSTR uri, _Out_ ResolvedLaunchTarget& resolved) noexcept
+// std::nullopt when the probe never reached a handler decision (an unregistered scheme)
+// - an ordinary answer, not something to propagate as an exception.
+inline std::optional<ResolvedLaunchTarget> ProbeResolvedLaunchTarget(PCWSTR uri)
 {
-    resolved = {};
-    LaunchSiteObservations observations;
-    RETURN_IF_FAILED(ProbeUriLaunchTarget(uri, observations));
-    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_NOT_FOUND), observations.applicationPath.empty());
+    const auto observations = ProbeUriLaunchTarget(uri);
+    if (!observations.probeCancelled || observations.applicationPath.empty())
+    {
+        return std::nullopt;
+    }
+
+    ResolvedLaunchTarget resolved;
     resolved.executablePath = observations.applicationPath;
-    return S_OK;
+    resolved.packageFamilyName = observations.handlerPackageFamilyName;
+    return resolved;
 }
 
 } // namespace TargetedLaunch
