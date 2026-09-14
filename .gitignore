@@ -158,6 +158,10 @@ nCrunchTemp_*
 
 # MightyMoose
 *.mm.*
+
+# TargetedLaunch sample outputs
+Samples/LaunchResponseSample/AppxLayout.*/
+Samples/LaunchResponseSample/Assets/
 AutoTest.Net/
 
 # Web workbench (sass)

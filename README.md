@@ -21,6 +21,23 @@ handlers, use the TargetedLaunch ShellExecute site path; `ShellExecuteExW` has n
 package-family selector and cannot by itself prove the ultimate single-instance process
 after a relay.
 
+### Executable launch/response matrix
+
+`Samples\LaunchResponseSample` is the runnable cross-process demonstration. It uses
+`Windows.ApplicationModel.AppInstance` for the packaged already-running-instance case:
+the second process redirects its actual activation arguments to the first instance, which
+receives the URI through `AppInstance::Activated`. This shows why a transient process
+returned by an after-create callback must not be treated as the response target.
+
+Build the sample with `Samples\LaunchResponseSample\Samples.sln`. Run
+`Build-Packages.ps1` from that directory to create unsigned requester and responder
+registration layouts. Register each layout's `AppxManifest.xml` with
+`Add-AppxPackage -Register`; the sample README gives the exact commands and the full
+policy matrix. Its output also reports the immediate parent PID, path, creation time,
+and creation-time plausibility check. Parentage is evidence of OS process ancestry only;
+packaged activation must use the explicit request token, COM call context, or registered
+target window rather than assuming the parent is the requester.
+
 `LaunchUriForResultsAsync` is a platform request/response contract with package identity
 and manifest requirements. TargetedLaunch is the unpackaged, destination-enforcement
 building block: it makes the target policy explicit and refuses when the target process

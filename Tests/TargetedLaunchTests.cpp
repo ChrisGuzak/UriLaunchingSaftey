@@ -1042,6 +1042,21 @@ public:
 TEST_CLASS(TargetedLaunchSiteEnforcement)
 {
 public:
+    // The set is unordered, so names are sorted to keep the diagnostic output stable
+    // between runs and comparable between activation paths.
+    static std::vector<std::wstring> SortedServiceNames(LaunchSiteObservations const& observations)
+    {
+        std::vector<std::wstring> names;
+        names.reserve(observations.queriedServices.size());
+        for (auto const& serviceId : observations.queriedServices)
+        {
+            names.push_back(DescribeServiceId(serviceId));
+        }
+
+        std::sort(names.begin(), names.end());
+        return names;
+    }
+
     // The probe: a launch that is always cancelled, run only to harvest what the shell
     // resolved. Nothing is created.
     TEST_METHOD(ProbeReportsTheShellResolvedTarget)
@@ -1050,15 +1065,65 @@ public:
 
         const auto observations = ProbeUriLaunchTarget(L"http://example.com");
 
-        cpp_unit::Assert::IsTrue(observations.probeCancelled, L"a probe must always cancel");
-
-        cpp_unit::LogMessage(L"probe: createProcess=%d coCreate=%d",
-            observations.sawCreateProcess ? 1 : 0, observations.sawCoCreateInstance ? 1 : 0);
+        // Logged before the assertions: when a probe does not cancel, which callback the
+        // shell reached (or failed to reach) is the whole diagnosis.
+        cpp_unit::LogMessage(L"probe: queryService=%zu createProcess=%d coCreate=%d cancelled=%d decision=0x%08X",
+            observations.queriedServices.size(),
+            observations.sawCreateProcess ? 1 : 0, observations.sawCoCreateInstance ? 1 : 0,
+            observations.probeCancelled ? 1 : 0,
+            static_cast<unsigned int>(observations.decision));
         cpp_unit::LogMessage(L"probe: app=%ls", observations.applicationPath.c_str());
         cpp_unit::LogMessage(L"probe: cmd=%ls", observations.commandLine.c_str());
+        for (auto const& name : SortedServiceNames(observations))
+        {
+            cpp_unit::LogMessage(L"probe: QueryService %ls", name.c_str());
+        }
+
+        cpp_unit::Assert::IsFalse(observations.queriedServices.empty(),
+            L"the shell never consulted the site - the launch bypassed the policy entirely "
+            L"(the DirectLaunch fast path does this when the handler is already running)");
+
+        cpp_unit::Assert::IsTrue(observations.probeCancelled, L"a probe must always cancel");
 
         cpp_unit::Assert::IsFalse(observations.applicationPath.empty(),
             L"the probe yielded no application path");
+    }
+
+    // Diagnostic only: probes a .txt so the target is a *packaged* handler (Notepad),
+    // which the shell activates through CoCreateInstance rather than CreateProcess.
+    // Run it with the handler dead and again with it already running to see which
+    // callbacks the site is offered on each path.
+    TEST_METHOD(ProbeTextFileTargetDiagnostic)
+    {
+        auto apartment = wil::CoInitializeEx(COINIT_APARTMENTTHREADED);
+
+        wchar_t tempDirectory[MAX_PATH]{};
+        cpp_unit::Assert::IsTrue(GetTempPathW(ARRAYSIZE(tempDirectory), tempDirectory) != 0);
+
+        std::wstring sampleFile{tempDirectory};
+        sampleFile += L"targetedlaunch-probe-sample.txt";
+
+        {
+            wil::unique_hfile file{CreateFileW(sampleFile.c_str(), GENERIC_WRITE, 0, nullptr,
+                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr)};
+            cpp_unit::Assert::IsTrue(file.is_valid(), L"could not create the sample file");
+        }
+
+        const auto observations = ProbeUriLaunchTarget(sampleFile.c_str());
+
+        cpp_unit::LogMessage(L"txt probe: queryService=%zu createProcess=%d coCreate=%d cancelled=%d decision=0x%08X",
+            observations.queriedServices.size(),
+            observations.sawCreateProcess ? 1 : 0, observations.sawCoCreateInstance ? 1 : 0,
+            observations.probeCancelled ? 1 : 0,
+            static_cast<unsigned int>(observations.decision));
+        cpp_unit::LogMessage(L"txt probe: app=%ls", observations.applicationPath.c_str());
+        cpp_unit::LogMessage(L"txt probe: cmd=%ls", observations.commandLine.c_str());
+        for (auto const& name : SortedServiceNames(observations))
+        {
+            cpp_unit::LogMessage(L"txt probe: QueryService %ls", name.c_str());
+        }
+
+        DeleteFileW(sampleFile.c_str());
     }
 
     // The value of the probe over the association query: it is the shell's own

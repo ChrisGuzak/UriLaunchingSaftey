@@ -12,6 +12,14 @@
 #include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.ApplicationModel.AppExtensions.h>
 
+// Pulling the few types actually used into winrt:: keeps call sites short without
+// dragging whole namespaces in, where unrelated names can collide.
+namespace winrt
+{
+    using Windows::ApplicationModel::AppExtensions::AppExtensionCatalog;
+    using Windows::Foundation::Collections::IPropertySet;
+}
+
 #pragma comment(lib, "shlwapi.lib") // link to this
 
 // ---------------------------------------------------------------------------
@@ -85,11 +93,11 @@ struct LocalOnlyAppExtension
 // Reads the inner text of a leaf AppExtension property. A manifest element like
 // <Scheme>foo</Scheme> surfaces as props["Scheme"] -> IPropertySet -> ["#text"] -> "foo".
 inline std::wstring ReadLeafProperty(
-    winrt::Windows::Foundation::Collections::IPropertySet const& props, PCWSTR name)
+    winrt::IPropertySet const& props, PCWSTR name)
 {
     if (props && props.HasKey(name))
     {
-        if (auto leaf = props.Lookup(name).try_as<winrt::Windows::Foundation::Collections::IPropertySet>())
+        if (auto leaf = props.Lookup(name).try_as<winrt::IPropertySet>())
         {
             if (leaf.HasKey(L"#text"))
             {
@@ -125,11 +133,8 @@ inline std::vector<std::wstring> SplitDelimited(std::wstring const& value, wchar
 // scheme(s) it marks. Must run in an MTA (blocks on the async catalog/property calls).
 inline std::vector<LocalOnlyAppExtension> CollectLocalOnlyAppExtensionSchemes()
 {
-    using namespace winrt::Windows::ApplicationModel::AppExtensions;
-    using winrt::Windows::Foundation::Collections::IPropertySet;
-
     std::vector<LocalOnlyAppExtension> result;
-    auto catalog = AppExtensionCatalog::Open(c_localOnlyUriSchemeContract);
+    auto catalog = winrt::AppExtensionCatalog::Open(c_localOnlyUriSchemeContract);
     auto extensions = catalog.FindAllAsync().get();
     for (auto const& ext : extensions)
     {
@@ -145,7 +150,7 @@ inline std::vector<LocalOnlyAppExtension> CollectLocalOnlyAppExtensionSchemes()
             for (auto const& kv : props)
             {
                 std::wstring text;
-                if (auto leaf = kv.Value().try_as<IPropertySet>())
+                if (auto leaf = kv.Value().try_as<winrt::IPropertySet>())
                 {
                     if (leaf.HasKey(L"#text"))
                     {

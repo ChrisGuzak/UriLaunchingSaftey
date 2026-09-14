@@ -40,6 +40,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 
 #include <wil/com.h>
 #include <wil/registry.h>
@@ -1256,10 +1257,28 @@ struct ComServerBinary
     }
 };
 
+// GUIDs are not hashable out of the box, so a set of them needs this.
+struct GuidHash
+{
+    size_t operator()(GUID const& value) const noexcept
+    {
+        static_assert(sizeof(GUID) == 2 * sizeof(uint64_t), "GUID is not two 64-bit halves");
+        uint64_t halves[2]{};
+        memcpy(halves, &value, sizeof(halves));
+
+        const std::hash<uint64_t> hasher;
+        return hasher(halves[0]) ^ (hasher(halves[1]) << 1);
+    }
+};
+
 // What the site observed and decided. Kept separate from the site so it outlives the
 // launch call and can be inspected afterwards.
 struct LaunchSiteObservations
 {
+    // Every distinct SID the shell negotiated for. This doubles as the record of whether
+    // the site was consulted at all: empty means the shell never asked for anything, so
+    // no callback could have run and no policy could have been applied.
+    std::unordered_set<GUID, GuidHash> queriedServices;
     bool sawCreateProcess{};
     bool sawCoCreateInstance{};
     std::wstring applicationPath;   // fully expanded, as the shell resolved it
@@ -1664,6 +1683,11 @@ public:
     IFACEMETHODIMP QueryService(REFGUID serviceId, REFIID riid, _COM_Outptr_ void** ppv) noexcept override
     {
         *ppv = nullptr;
+        // Every SID is recorded, not just the two that are answered: the set the shell
+        // negotiates for is the full surface a site can influence, and it differs
+        // between activation paths. A non-empty set is also the proof that the site was
+        // reached at all.
+        m_observations->queriedServices.insert(serviceId);
         return ((serviceId == SID_SHandlerActivationHost) ||
                 (serviceId == SID_ExecuteCreatingProcess))
             ? QueryInterface(riid, ppv) : E_NOTIMPL;
@@ -1809,6 +1833,30 @@ private:
 // ProgId independently here, immediately before the call: that keeps this function's only
 // job as "drive ShellExecuteExW", and the resolution is authoritative anyway, since the
 // site chain below still judges whatever the shell actually does with it.
+// The class (ProgId or extension) that identifies a target to ShellExecute.
+//
+// This exists for a security reason, not a convenience one. Supplying a class sets
+// ShellExecute's internal _fUseClass, and CShellExecute::_TryDirectLaunch bails out
+// immediately when it is set. Without it, the shell's DirectLaunch fast path can hand
+// the request straight to an already-running handler window over WM_COPYDATA and return
+// success having never issued QueryService(SID_SHandlerActivationHost) - silently
+// skipping the veto this whole mitigation depends on.
+inline std::wstring ClassNameForTarget(PCWSTR target)
+{
+    const std::wstring_view view{target};
+
+    // A scheme needs more than one leading character, otherwise "C:\dir\file.txt" would
+    // be read as a URI in the "C" scheme.
+    const auto colon = view.find(L':');
+    if ((colon != std::wstring_view::npos) && (colon > 1))
+    {
+        return std::wstring{view.substr(0, colon)};
+    }
+
+    const auto dot = view.rfind(L'.');
+    return (dot != std::wstring_view::npos) ? std::wstring{view.substr(dot)} : std::wstring{};
+}
+
 inline LaunchTargetStatus LaunchUriWithSiteEnforcedTarget(
     PCWSTR uri,
     LaunchTargetPolicy const& policy,
@@ -1830,6 +1878,7 @@ inline LaunchTargetStatus LaunchUriWithSiteEnforcedTarget(
     info.hInstApp = reinterpret_cast<HINSTANCE>(site->GetAsSite());
 
     std::optional<ResolvedUriHandler> selectedHandler;
+    std::wstring defaultClassName;
     if (!handlerSelection.IsDefault())
     {
         const std::wstring_view uriView{uri};
@@ -1853,6 +1902,17 @@ inline LaunchTargetStatus LaunchUriWithSiteEnforcedTarget(
         info.fMask |= SEE_MASK_CLASSNAME;
         info.lpClass = selectedHandler->progId.c_str();
     }
+    else
+    {
+        // No explicit selection, but the class is still supplied: it is what keeps the
+        // launch off the DirectLaunch fast path, which would bypass the site entirely.
+        defaultClassName = ClassNameForTarget(uri);
+        if (!defaultClassName.empty())
+        {
+            info.fMask |= SEE_MASK_CLASSNAME;
+            info.lpClass = defaultClassName.c_str();
+        }
+    }
 
     if (!ShellExecuteExW(&info))
     {
@@ -1875,6 +1935,20 @@ inline LaunchTargetStatus LaunchUriWithSiteEnforcedTarget(
     {
         return LaunchTargetStatus::Refused;
     }
+
+    // Fail closed. The shell reported success, but if it never asked the site for
+    // anything then the policy was never applied and the target was never seen - the
+    // request was serviced by a path that skips the veto (DirectLaunch handing it to an
+    // already-running handler, for one). Reporting Allowed here would mean "the policy
+    // accepted it", which is false: nothing was checked. Note this is detection, not
+    // prevention - by the time it is observed the app has already been given the
+    // request, which is exactly why supplying the class above matters.
+    if (sink.queriedServices.empty())
+    {
+        sink.decision = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        return LaunchTargetStatus::Unverifiable;
+    }
+
     return LaunchTargetStatus::Allowed;
 }
 
@@ -1894,6 +1968,54 @@ inline LaunchTargetStatus LaunchUriWithSiteEnforcedTarget(
 // An unregistered scheme is an ordinary probe answer, not a failure: 'probeCancelled'
 // tells the caller whether the shell reached a handler decision at all, so this returns
 // the observations unconditionally rather than throwing for "nothing to report".
+// A readable name for a negotiated service, so the SID list is legible in a log.
+// Unknown SIDs are printed as raw GUIDs - those are the interesting ones.
+inline std::wstring DescribeServiceId(REFGUID serviceId)
+{
+    static const struct { const GUID* id; PCWSTR name; } knownServices[] =
+    {
+        { &SID_SHandlerActivationHost,  L"SID_SHandlerActivationHost" },
+        { &SID_ExecuteCreatingProcess,  L"SID_ExecuteCreatingProcess" },
+    };
+
+    for (auto const& known : knownServices)
+    {
+        if (serviceId == *known.id)
+        {
+            return known.name;
+        }
+    }
+
+    // Names recovered from the Windows shell headers (shpriv_core.idl,
+    // immersiveapplaunch.idl). They are not in the public SDK, so they are matched by
+    // value. Recorded because the set the shell negotiates for is the surface a site
+    // could influence, and it differs between activation paths.
+    static const struct { GUID id; PCWSTR name; } shellPrivateServices[] =
+    {
+        { {0x582b888f,0x80d5,0x4bc4,{0x9a,0x6d,0x5d,0x7a,0x58,0xef,0xd6,0x0a}}, L"SID_ExecuteLogUsage" },
+        { {0xd9fd6033,0x72f7,0x4763,{0xbc,0x7d,0xc0,0x37,0x13,0xd7,0xd1,0xc5}}, L"SID_ExecuteNoZoneChecks" },
+        { {0x99405986,0xef59,0x433e,{0xb3,0x93,0x76,0x54,0xa9,0xf3,0x8c,0xf2}}, L"SID_RegenerateEnvironment" },
+        { {0xcdb65641,0x7618,0x4871,{0xa1,0xfb,0x15,0x1a,0x88,0xdb,0x3f,0x94}}, L"IExecuteCommandNotify" },
+        { {0x3552e971,0x528c,0x4988,{0xbe,0x75,0x64,0x95,0x2f,0x5f,0x85,0xa6}}, L"IWowExecuteCallback" },
+        { {0x1983b4c3,0x12cb,0x4a7a,{0xb8,0xf6,0x24,0x7d,0x9c,0x70,0xfd,0x2c}}, L"IBindAndInvokeStaticVerb" },
+        { {0xe7e281ba,0x1399,0x4f64,{0x8e,0x52,0x12,0xec,0x05,0xc5,0xdf,0x71}}, L"IVerifyingTrust" },
+        { {0xfc992f1f,0xdebb,0x4596,{0xb3,0x55,0x50,0xc7,0xa6,0xdd,0x12,0x22}}, L"IWaitCursorManager" },
+        { {0xbafa21d8,0xb071,0x4cd8,{0x85,0x3e,0x34,0x12,0x03,0xe5,0x57,0xd3}}, L"ILauncherOptions" },
+    };
+
+    for (auto const& known : shellPrivateServices)
+    {
+        if (serviceId == known.id)
+        {
+            return known.name;
+        }
+    }
+
+    wchar_t buffer[64]{};
+    StringFromGUID2(serviceId, buffer, ARRAYSIZE(buffer));
+    return buffer;
+}
+
 inline LaunchSiteObservations ProbeUriLaunchTarget(PCWSTR uri)
 {
     LaunchSiteObservations observations;
@@ -1909,7 +2031,24 @@ inline LaunchSiteObservations ProbeUriLaunchTarget(PCWSTR uri)
     info.nShow = SW_NORMAL;
     info.hInstApp = reinterpret_cast<HINSTANCE>(site->GetAsSite());
 
-    ShellExecuteExW(&info);
+    // Critical for a probe specifically. A probe promises to create nothing, and it keeps
+    // that promise by cancelling from the site callbacks - so a path that never consults
+    // the site turns the probe into a real launch. Supplying the class forces the shell
+    // off DirectLaunch and back onto the route where the callbacks actually fire.
+    const std::wstring className = ClassNameForTarget(uri);
+    if (!className.empty())
+    {
+        info.fMask |= SEE_MASK_CLASSNAME;
+        info.lpClass = className.c_str();
+    }
+
+    // The result is recorded rather than discarded: "the shell refused to execute at all"
+    // and "the shell executed without ever consulting the site" are completely different
+    // failures, and without this they look identical to a caller.
+    if (!ShellExecuteExW(&info))
+    {
+        observations.decision = HRESULT_FROM_WIN32(GetLastError());
+    }
 
     return observations;
 }
