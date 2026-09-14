@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="..\..\Tests\packages\Microsoft.Windows.CppWinRT.2.0.240405.15\build\native\Microsoft.Windows.CppWinRT.props" Condition="Exists('..\..\Tests\packages\Microsoft.Windows.CppWinRT.2.0.240405.15\build\native\Microsoft.Windows.CppWinRT.props')" />
+  <Import Project="packages\Microsoft.WindowsAppSDK.1.6.250205002\build\native\Microsoft.WindowsAppSDK.props" Condition="Exists('packages\Microsoft.WindowsAppSDK.1.6.250205002\build\native\Microsoft.WindowsAppSDK.props')" />
+  <Import Project="packages\Microsoft.Web.WebView2.1.0.2903.40\build\native\Microsoft.Web.WebView2.props" Condition="Exists('packages\Microsoft.Web.WebView2.1.0.2903.40\build\native\Microsoft.Web.WebView2.props')" />
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration><Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration><Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{DDF9D4A4-2F21-46AA-8B50-36A0C8B4CC21}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>LaunchResponseSample</RootNamespace>
+    <ProjectName>LaunchResponseSample</ProjectName>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType><UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset><CharacterSet>Unicode</CharacterSet>
+    <IntDir>$(ProjectDir)obj\$(Platform)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset><CharacterSet>Unicode</CharacterSet>
+    <IntDir>$(ProjectDir)obj\$(Platform)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"
+      Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" />
+  </ImportGroup>
+  <ItemDefinitionGroup>
+    <ClCompile><WarningLevel>Level3</WarningLevel><SDLCheck>true</SDLCheck><LanguageStandard>stdcpp17</LanguageStandard>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link><SubSystem>Console</SubSystem></Link>
+  </ItemDefinitionGroup>
+  <ItemGroup><ClCompile Include="LaunchResponseSample.cpp" /></ItemGroup>
+  <ItemGroup><None Include="packages.config" /></ItemGroup>
+  <ItemGroup><None Include=".runsettings" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="..\..\Tests\packages\Microsoft.Windows.CppWinRT.2.0.240405.15\build\native\Microsoft.Windows.CppWinRT.targets" Condition="Exists('..\..\Tests\packages\Microsoft.Windows.CppWinRT.2.0.240405.15\build\native\Microsoft.Windows.CppWinRT.targets')" />
+    <Import Project="..\..\Tests\packages\Microsoft.Windows.ImplementationLibrary.1.0.250325.1\build\native\Microsoft.Windows.ImplementationLibrary.targets" Condition="Exists('..\..\Tests\packages\Microsoft.Windows.ImplementationLibrary.1.0.250325.1\build\native\Microsoft.Windows.ImplementationLibrary.targets')" />
+    <Import Project="packages\Microsoft.WindowsAppSDK.1.6.250205002\build\native\Microsoft.WindowsAppSDK.targets" Condition="Exists('packages\Microsoft.WindowsAppSDK.1.6.250205002\build\native\Microsoft.WindowsAppSDK.targets')" />
+    <Import Project="packages\Microsoft.Web.WebView2.1.0.2903.40\build\native\Microsoft.Web.WebView2.targets" Condition="Exists('packages\Microsoft.Web.WebView2.1.0.2903.40\build\native\Microsoft.Web.WebView2.targets')" />
+  </ImportGroup>
+  <Target Name="EnsureNuGetPackageBuildImports" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('..\..\Tests\packages\Microsoft.Windows.CppWinRT.2.0.240405.15\build\native\Microsoft.Windows.CppWinRT.props')" Text="Microsoft.Windows.CppWinRT is missing. Restore Tests\packages.config before building this sample." />
+    <Error Condition="!Exists('..\..\Tests\packages\Microsoft.Windows.ImplementationLibrary.1.0.250325.1\build\native\Microsoft.Windows.ImplementationLibrary.targets')" Text="Microsoft.Windows.ImplementationLibrary is missing. Restore Tests\packages.config before building this sample." />
+    <Error Condition="!Exists('packages\Microsoft.WindowsAppSDK.1.6.250205002\build\native\Microsoft.WindowsAppSDK.props')" Text="Microsoft.WindowsAppSDK is missing. Restore Samples\LaunchResponseSample\packages.config before building this sample." />
+    <Error Condition="!Exists('packages\Microsoft.Web.WebView2.1.0.2903.40\build\native\Microsoft.Web.WebView2.targets')" Text="Microsoft.Web.WebView2 is missing. Restore Samples\LaunchResponseSample\packages.config before building this sample." />
+  </Target>
+</Project>
